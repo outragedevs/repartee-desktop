@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="repartee — A modern terminal IRC client built with Ratatui, Tokio, and Rust. Scripting, theming, encrypted logging, and more.">
+  <meta name="keywords" content="irc, terminal, tui, client, chat, repartee, ratatui, tokio, rust">
+  <meta name="author" content="outragedevs">
+  <meta property="og:title" content="Configuration — repartee">
+  <meta property="og:description" content="A modern terminal IRC client built with Ratatui, Tokio, and Rust. Inspired by irssi, designed for the future.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://outragedevs.github.io/repartee/">
+  <meta property="og:image" content="https://outragedevs.github.io/repartee/images/chat.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="{{title}} — repartee">
+  <meta name="twitter:description" content="A modern terminal IRC client built with Ratatui, Tokio, and Rust.">
+  <meta name="twitter:image" content="https://outragedevs.github.io/repartee/images/chat.png">
+  <title>{{title}} — repartee</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <!-- Mobile hamburger toggle -->
+  <button class="hamburger" aria-label="Toggle navigation">
+    <span></span>
+    <span></span>
+    <span></span>
+  </button>
+
+  <div class="page-wrapper">
+    <!-- Sidebar navigation -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <a href="index.html" class="brand">repartee</a>
+        <span class="brand-tagline">Documentation</span>
+      </div>
+      <nav class="sidebar-nav">
+          <ul>
+    <li><a href="index.html">Home</a></li>
+  </ul>
+  <div class="nav-section">
+    <span class="nav-section-title">Getting Started</span>
+    <ul>
+      <li><a href="installation.html">Installation</a></li>
+      <li><a href="first-connection.html">First Connection</a></li>
+      <li><a href="configuration.html" class="active">Configuration</a></li>
+    </ul>
+  </div>
+  <div class="nav-section">
+    <span class="nav-section-title">Reference</span>
+    <ul>
+      <li><a href="commands.html">Commands</a></li>
+      <li><a href="e2e.html">End-to-End Encryption</a></li>
+    </ul>
+  </div>
+  <div class="nav-section">
+    <span class="nav-section-title">Scripting</span>
+    <ul>
+      <li><a href="scripting-getting-started.html">Getting Started</a></li>
+      <li><a href="scripting-api.html">API Reference</a></li>
+      <li><a href="scripting-examples.html">Examples</a></li>
+    </ul>
+  </div>
+  <div class="nav-section">
+    <span class="nav-section-title">Customization</span>
+    <ul>
+      <li><a href="theming.html">Theming</a></li>
+      <li><a href="theming-format-strings.html">Format Strings</a></li>
+      <li><a href="logging.html">Logging & Search</a></li>
+    </ul>
+  </div>
+  <div class="nav-section">
+    <span class="nav-section-title">Usage</span>
+    <ul>
+      <li><a href="web-frontend.html">Web Frontend</a></li>
+      <li><a href="sessions.html">Sessions & Detach</a></li>
+    </ul>
+  </div>
+  <div class="nav-section">
+    <span class="nav-section-title">Project</span>
+    <ul>
+      <li><a href="architecture.html">Architecture</a></li>
+      <li><a href="faq.html">FAQ</a></li>
+    </ul>
+  </div>
+
+      </nav>
+      <div class="sidebar-footer">
+        Built with <a href="https://www.rust-lang.org">Rust</a>
+        &middot;
+        <a href="https://repart.ee/">GitHub</a>
+      </div>
+    </aside>
+
+    <!-- Overlay for mobile sidebar -->
+    <div class="sidebar-overlay"></div>
+
+    <!-- Main content -->
+    <div class="content-wrapper">
+      <main class="content">
+        <h1>Configuration</h1>
+<h2>Config location</h2>
+<p>repartee stores its configuration in <code>~/.repartee/config.toml</code>. This file is created automatically on first run with sensible defaults.</p>
+<p>The full directory layout:</p>
+<pre><code>~/.repartee/
+  config.toml          # main configuration
+  .env                 # credentials (passwords, SASL)
+  themes/              # custom themes
+  scripts/             # user scripts (Lua)
+  logs/messages.db     # chat logs (SQLite)
+  dicts/               # Hunspell dictionaries (.dic/.aff)
+  sessions/            # Unix sockets for detached sessions
+  certs/               # TLS certificates for web frontend
+</code></pre>
+<h2>Full annotated example</h2>
+<pre><code class="language-toml">[general]
+nick = &quot;mynick&quot;
+username = &quot;mynick&quot;
+realname = &quot;repartee user&quot;
+theme = &quot;default&quot;
+timestamp_format = &quot;%H:%M:%S&quot;
+flood_protection = true
+flood_exemptions = []  # nick or nick!user@host wildcard masks exempt from PRIVMSG flood checks
+ctcp_version = &quot;repartee&quot;
+
+[display]
+nick_column_width = 8
+nick_max_length = 8
+nick_alignment = &quot;right&quot;       # &quot;left&quot;, &quot;right&quot;, or &quot;center&quot;
+nick_truncation = true
+nick_colors = true             # deterministic per-nick coloring (WeeChat-style)
+nick_colors_in_nicklist = true # also color nicks in the sidebar nick list
+nick_color_saturation = 0.65   # HSL saturation (0.0–1.0), truecolor only
+nick_color_lightness = 0.65    # HSL lightness (0.0–1.0), tune per theme
+show_timestamps = true
+scrollback_lines = 2000
+backlog_lines = 20             # history lines loaded when buffer opens (0 = off)
+mentions_buffer = true         # show Mentions buffer at top of sidebar
+
+[sidepanel.left]
+width = 20
+visible = true
+
+[sidepanel.right]
+width = 18
+visible = true
+
+[statusbar]
+items = [&quot;active_windows&quot;, &quot;nick_info&quot;, &quot;channel_info&quot;, &quot;lag&quot;, &quot;time&quot;]
+
+[servers.libera]
+label = &quot;Libera&quot;
+address = &quot;irc.libera.chat&quot;
+port = 6697
+tls = true
+tls_verify = true
+autoconnect = true
+channels = [&quot;#repartee&quot;, &quot;#secret mykey&quot;]
+autosendcmd = &quot;MSG NickServ identify pass; WAIT 2000; MODE $N +i&quot;
+# nick = &quot;othernick&quot;           # per-server nick override
+# sasl_user = &quot;mynick&quot;
+# sasl_pass = &quot;hunter2&quot;
+# sasl_mechanism = &quot;SCRAM-SHA-256&quot;  # PLAIN (default), EXTERNAL, SCRAM-SHA-256
+# bind_ip = &quot;192.168.1.100&quot;   # bind to specific local IP (vhost)
+# auto_reconnect = true
+# reconnect_delay = 30
+# reconnect_max_retries = 10
+
+[image_preview]
+enabled = true
+protocol = &quot;auto&quot;              # &quot;auto&quot;, &quot;kitty&quot;, &quot;iterm2&quot;, &quot;sixel&quot;, &quot;symbols&quot;
+max_width = 0                  # 0 = auto
+max_height = 0                 # 0 = auto
+cache_max_mb = 100
+cache_max_days = 7
+fetch_timeout = 30             # seconds
+max_file_size = 10485760       # bytes (10 MB)
+kitty_format = &quot;rgba&quot;
+
+[logging]
+enabled = true
+encrypt = false
+retention_days = 0             # 0 = keep forever
+event_retention_hours = 72     # auto-prune join/part/quit/nick/kick/mode (0 = keep forever)
+exclude_types = []             # e.g. [&quot;join&quot;, &quot;part&quot;, &quot;quit&quot;]
+
+[aliases]
+ns = &quot;/msg NickServ $*&quot;
+cs = &quot;/msg ChanServ $*&quot;
+wc = &quot;/close&quot;
+j = &quot;/join $0; /msg $0 hello everyone&quot;
+
+[scripts]
+autoload = [&quot;slap&quot;]
+# debug = true
+
+[dcc]
+timeout = 300                  # seconds before pending requests expire
+own_ip = &quot;&quot;                    # override IP in DCC offers (empty = auto-detect)
+port_range = &quot;0&quot;               # &quot;0&quot; = OS-assigned, &quot;1025 65535&quot; = range
+autoaccept_lowports = false    # allow auto-accept from ports &lt; 1024
+# autochat_masks = [&quot;*!*@trusted.host&quot;]  # hostmask patterns for auto-accept
+max_connections = 10
+
+[spellcheck]
+enabled = true
+languages = [&quot;en_US&quot;]              # Hunspell language codes
+dictionary_dir = &quot;&quot;                # default: ~/.repartee/dicts
+
+[web]
+enabled = false                    # enable embedded web frontend
+bind_address = &quot;127.0.0.1&quot;        # listen address (0.0.0.0 for LAN)
+port = 8443                        # HTTPS port
+tls_cert = &quot;&quot;                      # custom cert (empty = auto self-signed)
+tls_key = &quot;&quot;                       # custom key
+timestamp_format = &quot;%H:%M&quot;        # web UI timestamp format
+line_height = 1.35                 # CSS line-height for chat messages
+theme = &quot;nightfall&quot;                # web theme (nightfall, catppuccin-mocha, etc.)
+# cloudflare_tunnel_name = &quot;&quot;     # future: Cloudflare tunnel name
+
+[[ignores]]
+mask = &quot;*!*@spammer.host&quot;
+levels = [&quot;ALL&quot;]
+</code></pre>
+<h2>Sections explained</h2>
+<h3><code>[general]</code></h3>
+<p>Global identity and behavior. The <code>nick</code>, <code>username</code>, and <code>realname</code> are used as defaults for all servers unless overridden per-server. Set <code>theme</code> to the name of a theme file in <code>~/.repartee/themes/</code> (without the <code>.theme</code> extension). <code>flood_exemptions</code> accepts bare nick patterns or full <code>nick!user@host</code> wildcard masks that bypass local incoming <code>PRIVMSG</code> flood checks.</p>
+<h3><code>[display]</code></h3>
+<p>Controls how messages are rendered. <code>nick_column_width</code> sets the fixed-width column for nicks in chat view. <code>scrollback_lines</code> is the number of messages kept in memory per buffer. <code>backlog_lines</code> sets how many historical messages to load from the log database when a channel, query, or DCC buffer is first opened (0 to disable).</p>
+<p><strong>Mentions buffer:</strong> <code>mentions_buffer = true</code> (default) shows a persistent Mentions buffer pinned at the top of the sidebar. It aggregates all highlight mentions from all networks in a scrollable chat view. Scrollback is capped at 7 days or 1000 messages. Use <code>/clear</code> in the mentions buffer to wipe all stored mentions. Set to <code>false</code> to hide the buffer (mentions are still stored in the database and will reappear when re-enabled).</p>
+<p><strong>Nick coloring:</strong> <code>nick_colors = true</code> enables deterministic per-nick coloring (WeeChat-style). Each nick gets a consistent color based on a hash of its name. Truecolor terminals use an HSL hue wheel (~360 distinct colors); 256-color terminals fall back to a curated 68-color palette; 16-color terminals use 12 safe ANSI colors. Terminal capability is auto-detected (and re-detected on <code>repartee a</code> reattach). Set <code>nick_colors_in_nicklist = false</code> to keep the sidebar nick list using theme colors while chat messages stay colored. Tune <code>nick_color_saturation</code> and <code>nick_color_lightness</code> (0.0–1.0) per theme — dark themes work well with ~0.65, light themes around ~0.40.</p>
+<h3><code>[sidepanel]</code></h3>
+<p>Left panel shows buffer list, right panel shows nick list. Set <code>visible = false</code> to hide a panel. Widths are in terminal columns.</p>
+<h3><code>[statusbar]</code></h3>
+<p>Configure which items appear in the status line. Available items: <code>active_windows</code>, <code>nick_info</code>, <code>channel_info</code>, <code>lag</code>, <code>time</code>.</p>
+<h3><code>[servers.*]</code></h3>
+<p>Each server gets a unique identifier (the key after <code>servers.</code>). The <code>channels</code> array lists channels to auto-join on connect. Channels with keys use the format <code>&quot;#channel key&quot;</code>.</p>
+<p>Set <code>sasl_mechanism</code> to override automatic mechanism selection. Available: <code>PLAIN</code> (default), <code>EXTERNAL</code> (client TLS certificate), <code>SCRAM-SHA-256</code> (secure challenge-response).</p>
+<p>Set <code>bind_ip</code> to bind to a specific local IP address when connecting. Useful for multi-IP hosts (vhosts/bouncers). Supports both IPv4 and IPv6 — DNS resolution automatically filters to match the address family. Can also be set per-connection with <code>/connect -bind=&lt;ip&gt;</code> or <code>/server add -bind=&lt;ip&gt;</code>.</p>
+<h3><code>[logging]</code></h3>
+<p>Chat logging to SQLite. When <code>encrypt = true</code>, messages are encrypted with AES-256-GCM. <code>retention_days = 0</code> keeps logs forever. <code>event_retention_hours</code> controls how long event messages (join/part/quit/nick/kick/mode) are kept before automatic pruning — defaults to 72 hours. Set to <code>0</code> to keep event messages forever. Event pruning runs hourly in the background and is independent of <code>retention_days</code>.</p>
+<h3><code>[aliases]</code></h3>
+<p>Custom command shortcuts. The key is the alias name, the value is the command template.</p>
+<p>Templates support positional args (<code>$0</code>-<code>$9</code>), range args (<code>$1-</code>), all args (<code>$*</code>), context variables (<code>$C</code> channel, <code>$N</code> nick, <code>$S</code> server, <code>$T</code> buffer), and command chaining with <code>;</code>. If no <code>$</code> appears in the template, <code>$*</code> is appended automatically.</p>
+<pre><code class="language-toml">[aliases]
+ns = &quot;/msg NickServ $*&quot;
+cs = &quot;/msg ChanServ $*&quot;
+wc = &quot;/close&quot;
+j = &quot;/join $0; /msg $0 hello everyone&quot;
+w = &quot;/who $C&quot;
+</code></pre>
+<p>Manage at runtime with <code>/alias</code> and <code>/unalias</code>.</p>
+<h3><code>[scripts]</code></h3>
+<p>The <code>autoload</code> array lists script names to load on startup. Scripts live in <code>~/.repartee/scripts/</code> as <code>.lua</code> files.</p>
+<h3><code>[dcc]</code></h3>
+<p>DCC (Direct Client-to-Client) chat settings. DCC CHAT establishes peer-to-peer TCP connections that bypass the IRC server.</p>
+<p><code>own_ip</code> overrides the IP address advertised in DCC offers. When empty, Repartee auto-detects from the IRC socket&#39;s local address (like irssi&#39;s <code>getsockname</code>). Set this to your public IP if behind NAT.</p>
+<p><code>port_range</code> controls the TCP port for DCC listeners. <code>&quot;0&quot;</code> lets the OS assign a free port. Use <code>&quot;1025 65535&quot;</code> or <code>&quot;5000-5100&quot;</code> to restrict to a range (useful for firewall rules).</p>
+<p><code>autochat_masks</code> is a list of <code>nick!ident@host</code> wildcard patterns. Incoming DCC CHAT offers matching any pattern are auto-accepted without prompting.</p>
+<h3><code>[spellcheck]</code></h3>
+<p>Inline spell checking. When <code>enabled = true</code>, misspelled words are underlined in red while typing. Press Tab to cycle suggestions, Space to accept, Escape to revert. <code>languages</code> is a list of Hunspell language codes (e.g., <code>en_US</code>, <code>pl_PL</code>, <code>de_DE</code>) — a word is correct if <strong>any</strong> active dictionary accepts it. Place <code>.dic</code>/<code>.aff</code> files in <code>~/.repartee/dicts/</code> (or set <code>dictionary_dir</code> to a custom path).</p>
+<h3><code>[web]</code></h3>
+<p>Embedded web frontend. When <code>enabled = true</code> and <code>WEB_PASSWORD</code> is set in <code>.env</code>, the app starts an HTTPS server alongside the terminal interface. Both share the same state — read a message on web, it&#39;s marked read on terminal, and vice versa.</p>
+<p>Set <code>bind_address = &quot;0.0.0.0&quot;</code> to allow LAN access. TLS is always on — if no custom cert/key is provided, a self-signed certificate is auto-generated in <code>~/.repartee/certs/</code>.</p>
+<p>The <code>theme</code> setting controls the web UI appearance. Available: <code>nightfall</code> (default dark), <code>catppuccin-mocha</code>, <code>tokyo-storm</code>, <code>gruvbox-light</code>, <code>catppuccin-latte</code>.</p>
+<h3><code>[[ignores]]</code></h3>
+<p>Ignore patterns for filtering unwanted messages. Uses wildcard matching (<code>*!*@host</code>). Levels: <code>MSGS</code>, <code>PUBLIC</code>, <code>NOTICES</code>, <code>ACTIONS</code>, <code>JOINS</code>, <code>PARTS</code>, <code>QUITS</code>, <code>NICKS</code>, <code>KICKS</code>, <code>CTCPS</code>, <code>ALL</code>.</p>
+<h2>Credentials</h2>
+<p>Passwords and SASL credentials should <strong>not</strong> go in <code>config.toml</code> — store them in <code>~/.repartee/.env</code> instead.</p>
+<pre><code class="language-bash"># ~/.repartee/.env
+LIBERA_SASL_USER=mynick
+LIBERA_SASL_PASS=hunter2
+LIBERA_PASSWORD=serverpassword
+WEB_PASSWORD=mysecretpassword
+</code></pre>
+<p>Server credentials use the server identifier uppercased. <code>WEB_PASSWORD</code> is required for the web frontend — the server won&#39;t start without it.</p>
+<h2>Runtime changes</h2>
+<ul>
+<li><strong><code>/set section.field value</code></strong> — change a config value at runtime. Changes are saved immediately.</li>
+<li><strong><code>/reload</code></strong> — reload theme and config from disk.</li>
+</ul>
+
+
+        <!-- Prev / Next navigation -->
+        <nav class="page-nav">
+          <a href="first-connection.html" class="page-nav-link prev">
+  <span class="page-nav-label">&larr; Previous</span>
+  <span class="page-nav-title">First Connection</span>
+</a>
+          <a href="commands.html" class="page-nav-link next">
+  <span class="page-nav-label">Next &rarr;</span>
+  <span class="page-nav-title">Commands</span>
+</a>
+        </nav>
+
+        <footer class="site-footer">
+          Built with <a href="https://www.rust-lang.org">Rust</a> &middot;
+          <a href="https://repart.ee/">GitHub</a> &middot;
+          MIT License
+        </footer>
+      </main>
+    </div>
+  </div>
+
+  <script>
+    // Mobile sidebar toggle
+    (function() {
+      const hamburger = document.querySelector('.hamburger');
+      const sidebar = document.querySelector('.sidebar');
+      const overlay = document.querySelector('.sidebar-overlay');
+
+      function toggleSidebar() {
+        hamburger.classList.toggle('active');
+        sidebar.classList.toggle('open');
+        overlay.classList.toggle('visible');
+        document.body.style.overflow = sidebar.classList.contains('open') ? 'hidden' : '';
+      }
+
+      function closeSidebar() {
+        hamburger.classList.remove('active');
+        sidebar.classList.remove('open');
+        overlay.classList.remove('visible');
+        document.body.style.overflow = '';
+      }
+
+      hamburger.addEventListener('click', toggleSidebar);
+      overlay.addEventListener('click', closeSidebar);
+
+      // Close sidebar on Escape key
+      document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape' && sidebar.classList.contains('open')) {
+          closeSidebar();
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

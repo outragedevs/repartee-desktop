@@ -1,0 +1,801 @@
+#![allow(clippy::redundant_pub_crate)]
+
+use std::collections::{HashMap, VecDeque};
+
+use super::helpers::add_local_event;
+use super::types::{C_CMD, C_DIM, C_ERR, C_HEADER, C_OK, C_RST, C_TEXT, CATEGORY_ORDER, divider};
+use crate::app::App;
+use crate::state::buffer::{ActivityLevel, Buffer, BufferType, make_buffer_id};
+
+pub(crate) fn cmd_quit(app: &mut App, args: &[String]) {
+    if !args.is_empty() {
+        app.quit_message = Some(args.join(" "));
+    }
+    app.should_quit = true;
+    // QUIT is sent once in the post-loop cleanup (App::run) to avoid
+    // double-QUIT which triggers "Excess Flood" on strict servers.
+}
+
+#[expect(
+    clippy::missing_const_for_fn,
+    reason = "consistent with other command handlers"
+)]
+pub(crate) fn cmd_detach(app: &mut App, _args: &[String]) {
+    app.should_detach = true;
+}
+
+pub(crate) fn cmd_help(app: &mut App, args: &[String]) {
+    if args.is_empty() {
+        show_command_list(app);
+    } else {
+        let name = args[0].strip_prefix('/').unwrap_or(&args[0]).to_lowercase();
+        show_command_help(app, &name);
+    }
+}
+
+fn show_command_list(app: &mut App) {
+    let commands = super::registry::get_commands();
+
+    add_local_event(app, &divider("Commands"));
+
+    for &cat in CATEGORY_ORDER {
+        let cmds_in_cat: Vec<_> = commands
+            .iter()
+            .filter(|(_, def)| def.category == cat)
+            .collect();
+        if cmds_in_cat.is_empty() {
+            continue;
+        }
+
+        add_local_event(app, &format!("  {C_HEADER}[{}]{C_RST}", cat.label()));
+        for (name, def) in &cmds_in_cat {
+            let aliases = if def.aliases.is_empty() {
+                String::new()
+            } else {
+                format!(" {C_DIM}({}){C_RST}", def.aliases.join(", "))
+            };
+            add_local_event(
+                app,
+                &format!(
+                    "    {C_CMD}/{name}{C_RST}{aliases} {C_DIM}{}{C_RST}",
+                    def.description
+                ),
+            );
+        }
+    }
+
+    add_local_event(app, "");
+    add_local_event(
+        app,
+        &format!("  {C_DIM}Type {C_CMD}/help <command>{C_DIM} for detailed help.{C_RST}"),
+    );
+    add_local_event(app, &divider(""));
+}
+
+fn show_command_help(app: &mut App, name: &str) {
+    let commands = super::registry::get_commands();
+
+    // Find by name or alias
+    let found = commands
+        .iter()
+        .find(|(cmd_name, def)| *cmd_name == name || def.aliases.contains(&name));
+
+    let Some((cmd_name, def)) = found else {
+        add_local_event(
+            app,
+            &format!("{C_ERR}Unknown command: /{name}. Type /help for a list.{C_RST}"),
+        );
+        return;
+    };
+
+    // Try loading detailed help from docs/commands/*.md
+    let doc = super::docs::help(cmd_name);
+
+    add_local_event(app, &divider(&format!("/{cmd_name}")));
+
+    // Description — prefer doc, fall back to registry
+    let description = doc.map_or(def.description, |d| d.description.as_str());
+    add_local_event(app, &format!("  {C_TEXT}{description}{C_RST}"));
+    add_local_event(app, "");
+
+    // Syntax from doc
+    if let Some(d) = doc
+        && !d.syntax.is_empty()
+    {
+        for line in d.syntax.lines() {
+            add_local_event(app, &format!("  {C_CMD}{line}{C_RST}"));
+        }
+    }
+
+    if !def.aliases.is_empty() {
+        let alias_list: Vec<String> = def.aliases.iter().map(|a| format!("/{a}")).collect();
+        add_local_event(
+            app,
+            &format!("  {C_DIM}Aliases: {}{C_RST}", alias_list.join(", ")),
+        );
+    }
+
+    // Body (detailed description) from doc
+    if let Some(d) = doc {
+        add_local_event(app, "");
+        for line in d.body.lines() {
+            if line.is_empty() {
+                add_local_event(app, "");
+            } else {
+                add_local_event(app, &format!("  {C_TEXT}{line}{C_RST}"));
+            }
+        }
+
+        // Subcommands
+        if !d.subcommands.is_empty() {
+            add_local_event(app, "");
+            add_local_event(app, &format!("  {C_HEADER}Subcommands:{C_RST}"));
+            for sub in &d.subcommands {
+                add_local_event(app, &format!("    {C_CMD}{}{C_RST}", sub.name));
+                if !sub.description.is_empty() {
+                    add_local_event(app, &format!("      {C_DIM}{}{C_RST}", sub.description));
+                }
+                if !sub.syntax.is_empty() {
+                    add_local_event(app, &format!("      {C_CMD}{}{C_RST}", sub.syntax));
+                }
+            }
+        }
+
+        // Examples
+        if !d.examples.is_empty() {
+            add_local_event(app, "");
+            add_local_event(app, &format!("  {C_HEADER}Examples:{C_RST}"));
+            for example in &d.examples {
+                add_local_event(app, &format!("    {C_CMD}{example}{C_RST}"));
+            }
+        }
+
+        // See Also
+        if !d.see_also.is_empty() {
+            add_local_event(app, "");
+            add_local_event(
+                app,
+                &format!("  {C_DIM}See also: {}{C_RST}", d.see_also.join(", ")),
+            );
+        }
+    }
+
+    add_local_event(app, &divider(""));
+}
+
+pub(crate) fn cmd_clear(app: &mut App, _args: &[String]) {
+    let is_mentions = app
+        .state
+        .active_buffer()
+        .is_some_and(|b| b.buffer_type == crate::state::buffer::BufferType::Mentions);
+    if let Some(buf) = app.state.active_buffer_mut() {
+        buf.messages.clear();
+        buf.messages.shrink_to(0);
+    }
+    // Truncate the mentions DB table when clearing the mentions buffer.
+    if is_mentions
+        && let Some(storage) = &app.storage
+        && let Ok(db) = storage.db.lock()
+    {
+        crate::storage::query::truncate_mentions(&db).ok();
+    }
+}
+
+pub(crate) fn cmd_close(app: &mut App, args: &[String]) {
+    let Some(buf) = app.state.active_buffer() else {
+        return;
+    };
+    let buf_id = buf.id.clone();
+    let buf_type = buf.buffer_type.clone();
+    let buf_name = buf.name.clone();
+    let conn_id = buf.connection_id.clone();
+
+    match buf_type {
+        crate::state::buffer::BufferType::Mentions => {
+            app.config.display.mentions_buffer = false;
+            let cfg_path = crate::constants::config_path();
+            crate::config::save_config(&cfg_path, &app.config).ok();
+            app.state.remove_buffer(&buf_id);
+        }
+        crate::state::buffer::BufferType::Channel => {
+            // Irssi-style fast close: drop the buffer locally first so
+            // the UI reacts instantly, then fire-and-forget PART to the
+            // server. We do NOT wait for the server-side echo before
+            // removing the buffer — on a laggy link the previous
+            // behaviour kept a dead window visible for seconds. The
+            // echo handler `handle_part` in irc/events.rs also calls
+            // `remove_buffer`; that call is now a no-op because the
+            // buffer is already gone (remove_buffer is idempotent).
+            let reason = if args.is_empty() {
+                "Window closed".to_string()
+            } else {
+                args.join(" ")
+            };
+            if let Some(handle) = app.irc_handles.get(&conn_id) {
+                let _ = handle
+                    .sender
+                    .send(irc::proto::Command::PART(buf_name, Some(reason)));
+            }
+            app.state.remove_buffer(&buf_id);
+        }
+        crate::state::buffer::BufferType::Query | crate::state::buffer::BufferType::DccChat => {
+            // DCC chat buffers close like query buffers — just remove locally.
+            app.state.remove_buffer(&buf_id);
+        }
+        crate::state::buffer::BufferType::Log => {
+            // Log buffers are read-only — `/close` just removes them from the
+            // sidebar; the underlying SQLite rows are untouched.
+            app.state.remove_buffer(&buf_id);
+        }
+        crate::state::buffer::BufferType::Shell => {
+            // Shell close is handled by App::close_shell_buffer() — wired in Task 5.
+            app.close_shell_buffer(&buf_id);
+        }
+        crate::state::buffer::BufferType::Server | crate::state::buffer::BufferType::Special => {
+            let is_disconnected = app.state.connections.get(&conn_id).is_none_or(|c| {
+                matches!(
+                    c.status,
+                    crate::state::connection::ConnectionStatus::Disconnected
+                        | crate::state::connection::ConnectionStatus::Error
+                )
+            });
+            if is_disconnected {
+                // Remove all buffers for this connection
+                let to_remove: Vec<String> = app
+                    .state
+                    .buffers
+                    .keys()
+                    .filter(|id| {
+                        app.state
+                            .buffers
+                            .get(id.as_str())
+                            .is_some_and(|b| b.connection_id == conn_id)
+                    })
+                    .cloned()
+                    .collect();
+                for id in to_remove {
+                    app.state.remove_buffer(&id);
+                }
+                app.state.connections.remove(&conn_id);
+            } else {
+                add_local_event(
+                    app,
+                    "Cannot close server buffer while connected. /disconnect first",
+                );
+            }
+        }
+    }
+
+    // Recreate default Status if no real buffers remain
+    app.ensure_default_status();
+}
+
+// === Alias commands ===
+
+pub(crate) fn cmd_alias(app: &mut App, args: &[String]) {
+    if args.is_empty() {
+        // List all aliases
+        let mut lines = vec![divider("Aliases")];
+        if app.config.aliases.is_empty() {
+            lines.push(format!("  {C_DIM}No aliases defined{C_RST}"));
+        } else {
+            let mut sorted: Vec<_> = app.config.aliases.iter().collect();
+            sorted.sort_by_key(|(a, _)| *a);
+            for (name, template) in sorted {
+                lines.push(format!(
+                    "  {C_CMD}/{name}{C_RST} = {C_TEXT}{template}{C_RST}"
+                ));
+            }
+        }
+        lines.push(divider(""));
+        for line in &lines {
+            add_local_event(app, line);
+        }
+        return;
+    }
+
+    // `/alias -name` removes the alias (irssi compat)
+    if let Some(removal) = args
+        .first()
+        .and_then(|a| a.strip_prefix('-'))
+        .filter(|_| args.len() == 1)
+    {
+        let name = removal.to_lowercase();
+        if app.config.aliases.remove(&name).is_some() {
+            app.cached_config_toml = None;
+            let _ = crate::config::save_config(&crate::constants::config_path(), &app.config);
+            add_local_event(app, &format!("{C_OK}Removed alias: /{name}{C_RST}"));
+        } else {
+            add_local_event(app, &format!("{C_ERR}No alias named: /{name}{C_RST}"));
+        }
+        return;
+    }
+
+    // `/alias name` (one arg, no body) — show that specific alias
+    if args.len() < 2 {
+        let name = args[0].strip_prefix('/').unwrap_or(&args[0]).to_lowercase();
+        if let Some(body) = app.config.aliases.get(&name) {
+            add_local_event(
+                app,
+                &format!("  {C_CMD}/{name}{C_RST} = {C_TEXT}{body}{C_RST}"),
+            );
+        } else {
+            add_local_event(app, &format!("{C_ERR}No alias named: /{name}{C_RST}"));
+        }
+        return;
+    }
+
+    let name = args[0].strip_prefix('/').unwrap_or(&args[0]).to_lowercase();
+    let template = args[1].clone();
+
+    // Check if it conflicts with a built-in command
+    let builtins = super::registry::get_command_names();
+    if builtins.contains(&name.as_str()) {
+        add_local_event(
+            app,
+            &format!("{C_ERR}Cannot override built-in command: /{name}{C_RST}"),
+        );
+        return;
+    }
+
+    app.config.aliases.insert(name.clone(), template.clone());
+    app.cached_config_toml = None;
+    let _ = crate::config::save_config(&crate::constants::config_path(), &app.config);
+    add_local_event(app, &format!("{C_OK}Alias /{name} = {template}{C_RST}"));
+}
+
+pub(crate) fn cmd_unalias(app: &mut App, args: &[String]) {
+    if args.is_empty() {
+        add_local_event(app, "Usage: /unalias <name>");
+        return;
+    }
+
+    let name = args[0].strip_prefix('/').unwrap_or(&args[0]).to_lowercase();
+
+    if app.config.aliases.remove(&name).is_some() {
+        app.cached_config_toml = None;
+        let _ = crate::config::save_config(&crate::constants::config_path(), &app.config);
+        add_local_event(app, &format!("{C_OK}Removed alias: /{name}{C_RST}"));
+    } else {
+        add_local_event(app, &format!("{C_ERR}No alias named: /{name}{C_RST}"));
+    }
+}
+
+// === Items command ===
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "single match dispatching all /items subcommands"
+)]
+pub(crate) fn cmd_items(app: &mut App, args: &[String]) {
+    if args.is_empty() || args[0] == "list" {
+        let mut lines = vec![divider("Statusbar Items")];
+        if app.config.statusbar.items.is_empty() {
+            lines.push(format!("  {C_DIM}No items configured{C_RST}"));
+        } else {
+            for (i, item) in app.config.statusbar.items.iter().enumerate() {
+                let name = statusbar_item_name(item);
+                lines.push(format!("  {C_CMD}{}. {name}{C_RST}", i + 1));
+            }
+        }
+        lines.push(format!("  {C_DIM}Available: {AVAILABLE_ITEMS}{C_RST}"));
+        lines.push(divider(""));
+        for line in &lines {
+            add_local_event(app, line);
+        }
+        return;
+    }
+
+    match args[0].as_str() {
+        "add" => {
+            if args.len() < 2 {
+                add_local_event(app, "Usage: /items add <item_name>");
+                return;
+            }
+            let item_name = &args[1];
+            match parse_statusbar_item(item_name) {
+                Some(item) => {
+                    // Check for duplicates
+                    if app.config.statusbar.items.contains(&item) {
+                        add_local_event(
+                            app,
+                            &format!("{C_ERR}{item_name} is already in the statusbar{C_RST}"),
+                        );
+                        return;
+                    }
+                    app.config.statusbar.items.push(item);
+                    app.cached_config_toml = None;
+                    let _ =
+                        crate::config::save_config(&crate::constants::config_path(), &app.config);
+                    add_local_event(app, &format!("{C_OK}Added {item_name} to statusbar{C_RST}"));
+                }
+                None => {
+                    add_local_event(
+                        app,
+                        &format!(
+                            "{C_ERR}Unknown item: {item_name}. Available: {AVAILABLE_ITEMS}{C_RST}"
+                        ),
+                    );
+                }
+            }
+        }
+        "remove" => {
+            if args.len() < 2 {
+                add_local_event(app, "Usage: /items remove <item_name>");
+                return;
+            }
+            let item_name = &args[1];
+            match parse_statusbar_item(item_name) {
+                Some(item) => {
+                    if let Some(pos) = app.config.statusbar.items.iter().position(|i| *i == item) {
+                        app.config.statusbar.items.remove(pos);
+                        app.cached_config_toml = None;
+                        let _ = crate::config::save_config(
+                            &crate::constants::config_path(),
+                            &app.config,
+                        );
+                        add_local_event(
+                            app,
+                            &format!("{C_OK}Removed {item_name} from statusbar{C_RST}"),
+                        );
+                    } else {
+                        add_local_event(
+                            app,
+                            &format!("{C_ERR}{item_name} is not in the statusbar{C_RST}"),
+                        );
+                    }
+                }
+                None => {
+                    add_local_event(
+                        app,
+                        &format!(
+                            "{C_ERR}Unknown item: {item_name}. Available: {AVAILABLE_ITEMS}{C_RST}"
+                        ),
+                    );
+                }
+            }
+        }
+        "move" => {
+            if args.len() < 3 {
+                add_local_event(app, "Usage: /items move <item_name> <position>");
+                return;
+            }
+            let item_name = &args[1];
+            let Some(item) = parse_statusbar_item(item_name) else {
+                add_local_event(
+                    app,
+                    &format!(
+                        "{C_ERR}Unknown item: {item_name}. Available: {AVAILABLE_ITEMS}{C_RST}"
+                    ),
+                );
+                return;
+            };
+            let Some(current_pos) = app.config.statusbar.items.iter().position(|i| *i == item)
+            else {
+                add_local_event(
+                    app,
+                    &format!("{C_ERR}{item_name} is not in the statusbar{C_RST}"),
+                );
+                return;
+            };
+            let Ok(new_pos) = args[2].parse::<usize>() else {
+                add_local_event(app, &format!("{C_ERR}Invalid position: {}{C_RST}", args[2]));
+                return;
+            };
+            if new_pos == 0 || new_pos > app.config.statusbar.items.len() {
+                add_local_event(
+                    app,
+                    &format!(
+                        "{C_ERR}Position must be 1-{}{C_RST}",
+                        app.config.statusbar.items.len()
+                    ),
+                );
+                return;
+            }
+            let removed = app.config.statusbar.items.remove(current_pos);
+            app.config.statusbar.items.insert(new_pos - 1, removed);
+            app.cached_config_toml = None;
+            let _ = crate::config::save_config(&crate::constants::config_path(), &app.config);
+            add_local_event(
+                app,
+                &format!("{C_OK}Moved {item_name} to position {new_pos}{C_RST}"),
+            );
+        }
+        "format" => {
+            if args.len() < 2 {
+                add_local_event(app, "Usage: /items format <item_name> [format_string]");
+                return;
+            }
+            let item_name = args[1].to_lowercase();
+            if parse_statusbar_item(&item_name).is_none() {
+                add_local_event(
+                    app,
+                    &format!(
+                        "{C_ERR}Unknown item: {item_name}. Available: {AVAILABLE_ITEMS}{C_RST}"
+                    ),
+                );
+                return;
+            }
+            if args.len() < 3 {
+                // Show current format
+                let fmt = app
+                    .config
+                    .statusbar
+                    .item_formats
+                    .get(&item_name)
+                    .map_or("(default)", String::as_str);
+                add_local_event(
+                    app,
+                    &format!("{C_CMD}{item_name}{C_RST} format: {C_TEXT}{fmt}{C_RST}"),
+                );
+                return;
+            }
+            let fmt = args[2].clone();
+            app.config
+                .statusbar
+                .item_formats
+                .insert(item_name.clone(), fmt.clone());
+            app.cached_config_toml = None;
+            let _ = crate::config::save_config(&crate::constants::config_path(), &app.config);
+            add_local_event(app, &format!("{C_OK}Set {item_name} format: {fmt}{C_RST}"));
+        }
+        "separator" => {
+            if args.len() < 2 {
+                add_local_event(
+                    app,
+                    &format!(
+                        "Current separator: {C_CMD}{}{C_RST}",
+                        app.config.statusbar.separator
+                    ),
+                );
+                return;
+            }
+            app.config.statusbar.separator.clone_from(&args[1]);
+            app.cached_config_toml = None;
+            let _ = crate::config::save_config(&crate::constants::config_path(), &app.config);
+            add_local_event(app, &format!("{C_OK}Separator set to: {}{C_RST}", args[1]));
+        }
+        "available" => {
+            add_local_event(
+                app,
+                &format!("Available statusbar items: {C_CMD}{AVAILABLE_ITEMS}{C_RST}"),
+            );
+        }
+        "reset" => {
+            app.config.statusbar.items = crate::config::StatusbarConfig::default().items;
+            app.config.statusbar.item_formats.clear();
+            app.config.statusbar.separator = " | ".to_string();
+            app.cached_config_toml = None;
+            let _ = crate::config::save_config(&crate::constants::config_path(), &app.config);
+            add_local_event(app, &format!("{C_OK}Statusbar reset to defaults{C_RST}"));
+        }
+        _ => {
+            add_local_event(
+                app,
+                "Usage: /items [list|add|remove|move|format|separator|available|reset]",
+            );
+        }
+    }
+}
+
+const AVAILABLE_ITEMS: &str = "time, nick_info, channel_info, lag, active_windows";
+
+fn parse_statusbar_item(name: &str) -> Option<crate::config::StatusbarItem> {
+    use crate::config::StatusbarItem;
+    match name.to_lowercase().as_str() {
+        "time" => Some(StatusbarItem::Time),
+        "nick_info" => Some(StatusbarItem::NickInfo),
+        "channel_info" => Some(StatusbarItem::ChannelInfo),
+        "lag" => Some(StatusbarItem::Lag),
+        "active_windows" => Some(StatusbarItem::ActiveWindows),
+        _ => None,
+    }
+}
+
+const fn statusbar_item_name(item: &crate::config::StatusbarItem) -> &'static str {
+    use crate::config::StatusbarItem;
+    match item {
+        StatusbarItem::Time => "time",
+        StatusbarItem::NickInfo => "nick_info",
+        StatusbarItem::ChannelInfo => "channel_info",
+        StatusbarItem::Lag => "lag",
+        StatusbarItem::ActiveWindows => "active_windows",
+    }
+}
+
+// === Shell commands ===
+
+pub(crate) fn cmd_shell(app: &mut App, args: &[String]) {
+    let sub = args.first().map_or("open", String::as_str);
+    match sub {
+        "open" | "" => shell_open(app, None),
+        "cmd" => {
+            let command = args.get(1).map(String::as_str);
+            if command.is_none() {
+                add_local_event(app, &format!("{C_ERR}Usage: /shell cmd <command>{C_RST}"));
+                return;
+            }
+            shell_open(app, command);
+        }
+        "close" => {
+            let shell_buf = app.state.active_buffer().and_then(|buf| {
+                if buf.buffer_type == BufferType::Shell {
+                    Some(buf.id.clone())
+                } else {
+                    None
+                }
+            });
+            let Some(buf_id) = shell_buf else {
+                add_local_event(app, &format!("{C_ERR}Active buffer is not a shell{C_RST}"));
+                return;
+            };
+            app.close_shell_buffer(&buf_id);
+            app.ensure_default_status();
+        }
+        "list" => {
+            let sessions: Vec<(String, String)> = app
+                .shell_mgr
+                .list_sessions()
+                .iter()
+                .map(|(id, _, label)| ((*id).to_string(), (*label).to_string()))
+                .collect();
+            if sessions.is_empty() {
+                add_local_event(app, &format!("{C_DIM}No active shell sessions{C_RST}"));
+                return;
+            }
+            add_local_event(app, &format!("{C_HEADER}Shell sessions:{C_RST}"));
+            for (id, label) in &sessions {
+                add_local_event(
+                    app,
+                    &format!("  {C_CMD}{id}{C_RST} — {C_TEXT}{label}{C_RST}"),
+                );
+            }
+        }
+        _ => {
+            // Treat unknown subcommand as a command to run.
+            shell_open(app, Some(sub));
+        }
+    }
+}
+
+/// Open a new shell session and create the associated buffer.
+fn shell_open(app: &mut App, command: Option<&str>) {
+    // Ensure the "Shell" sidebar header exists.
+    app.ensure_shell_connection();
+
+    // Compute actual chat area dimensions (matching the ratatui layout).
+    // Shell buffers never show the nick list panel.
+    let (cols, rows) = crate::ui::layout::compute_chat_area_size(
+        app.cached_term_cols,
+        app.cached_term_rows,
+        app.config.sidepanel.left.visible,
+        app.config.sidepanel.left.width,
+        false, // shell buffers never show nick list
+        0,
+    );
+    tracing::debug!(
+        term_cols = app.cached_term_cols,
+        term_rows = app.cached_term_rows,
+        left_visible = app.config.sidepanel.left.visible,
+        left_width = app.config.sidepanel.left.width,
+        pty_cols = cols,
+        pty_rows = rows,
+        "shell: opening PTY with computed dimensions"
+    );
+
+    // Determine the display label from the command basename.
+    let base_label = command
+        .and_then(|c| std::path::Path::new(c).file_name().and_then(|n| n.to_str()))
+        .map(String::from)
+        .or_else(|| {
+            std::env::var("SHELL").ok().and_then(|s| {
+                std::path::Path::new(&s)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(String::from)
+            })
+        })
+        .unwrap_or_else(|| "shell".to_string());
+
+    let buf_name = find_unique_shell_name(app, &base_label);
+    let buf_id = make_buffer_id(App::SHELL_CONN_ID, &buf_name);
+
+    match app.shell_mgr.open(cols, rows, command, &buf_id) {
+        Ok((_shell_id, _label)) => {
+            app.state.add_buffer(Buffer {
+                id: buf_id.clone(),
+                connection_id: App::SHELL_CONN_ID.to_string(),
+                buffer_type: BufferType::Shell,
+                name: buf_name,
+                messages: VecDeque::new(),
+                activity: ActivityLevel::None,
+                unread_count: 0,
+                last_read: chrono::Utc::now(),
+                topic: None,
+                topic_set_by: None,
+                users: HashMap::new(),
+                modes: None,
+                mode_params: None,
+                list_modes: HashMap::new(),
+                last_speakers: Vec::new(),
+                peer_handle: None,
+                log_total_lines: None,
+                log_oldest_ts: None,
+                log_newest_ts: None,
+                history_exhausted: false,
+                log_initial_loaded: false,
+            });
+            app.state.set_active_buffer(&buf_id);
+            app.shell_input_active = true;
+        }
+        Err(e) => {
+            add_local_event(app, &format!("{C_ERR}Failed to open shell: {e}{C_RST}"));
+        }
+    }
+}
+
+/// Find a unique shell buffer name, appending " (2)", " (3)", etc. on collision.
+fn find_unique_shell_name(app: &App, base: &str) -> String {
+    let candidate = make_buffer_id(App::SHELL_CONN_ID, base);
+    if !app.state.buffers.contains_key(&candidate) {
+        return base.to_string();
+    }
+    for n in 2..=100 {
+        let name = format!("{base} ({n})");
+        let candidate = make_buffer_id(App::SHELL_CONN_ID, &name);
+        if !app.state.buffers.contains_key(&candidate) {
+            return name;
+        }
+    }
+    format!("{base} ({})", app.shell_mgr.session_count() + 1)
+}
+
+/// `/emote` opens the picker; `/emote <name>` inserts `:name:` if known, else
+/// lists a few matching emote names to the active buffer.
+pub(crate) fn cmd_emote(app: &mut App, args: &[String]) {
+    if !app.emotes_input_enabled() {
+        add_local_event(
+            app,
+            "Emotes are disabled ([emotes] enabled=false or render=off)",
+        );
+        return;
+    }
+    // No argument (or a bare ":" / "::") opens the picker. Matching is
+    // case-insensitive (emote names are lowercase).
+    let query = args
+        .first()
+        .map_or(String::new(), |a| a.trim_matches(':').to_ascii_lowercase());
+    if query.is_empty() {
+        app.open_emote_picker();
+        return;
+    }
+    if let Some(idx) = crate::emotes::resolve(&query) {
+        // Reuse the shared insert path (current language; clears stale tab-state).
+        app.insert_emote_by_index(idx);
+    } else {
+        let hits: Vec<&str> = crate::emotes::tag_names()
+            .iter()
+            .filter(|n| n.contains(query.as_str()))
+            .take(10)
+            .copied()
+            .collect();
+        let msg = if hits.is_empty() {
+            format!("No emote matches \"{query}\"")
+        } else {
+            format!("Emotes matching \"{query}\": {}", hits.join(", "))
+        };
+        add_local_event(app, &msg);
+    }
+}
+
+/// `/wizard <kind> [args]` — open a guided popup form. Currently only
+/// `server [id]` (add, or edit an existing server pre-filled).
+pub(crate) fn cmd_wizard(app: &mut App, args: &[String]) {
+    match args.first().map(String::as_str) {
+        Some("server") => app.open_server_wizard(args.get(1).map(String::as_str)),
+        _ => add_local_event(
+            app,
+            &format!("{C_TEXT}Usage: /wizard server [id]  — open the add/edit-server form{C_RST}"),
+        ),
+    }
+}

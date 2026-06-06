@@ -1,0 +1,13 @@
+pub mod docs;
+pub(crate) mod handlers_admin;
+pub(crate) mod handlers_dcc;
+mod handlers_e2e;
+mod handlers_irc;
+pub(crate) mod handlers_logs;
+mod handlers_shrink;
+mod handlers_ui;
+pub mod helpers;
+pub mod parser;
+pub mod registry;
+pub mod settings;
+pub mod types;

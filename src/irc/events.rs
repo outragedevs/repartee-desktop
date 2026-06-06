@@ -1,0 +1,7145 @@
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
+use std::time::Instant;
+
+use chrono::{DateTime, Utc};
+use irc::proto::{Command, Message as IrcMessage, Prefix, Response};
+
+use crate::config::IgnoreLevel;
+use crate::irc::formatting::{
+    extract_nick, extract_nick_userhost, is_channel, is_server_prefix, modes_to_prefix,
+    strip_irc_formatting,
+};
+use crate::irc::ignore::{matches_mask_patterns, should_ignore};
+use crate::state::AppState;
+use crate::state::buffer::{
+    ActivityLevel, Buffer, BufferType, ListEntry, Message, MessageType, NickEntry, make_buffer_id,
+};
+use crate::state::connection::ConnectionStatus;
+
+/// Maximum number of entries stored per list mode type (bans, excepts, etc.).
+const MAX_LIST_MODE_ENTRIES: usize = 500;
+const BAN_MODE_KEY: &str = "b";
+
+fn contains_case_insensitive(set: &HashSet<String>, value: &str) -> bool {
+    set.contains(value) || set.iter().any(|entry| entry.eq_ignore_ascii_case(value))
+}
+
+fn remove_case_insensitive(set: &mut HashSet<String>, value: &str) -> bool {
+    if set.remove(value) {
+        return true;
+    }
+    let Some(existing) = set
+        .iter()
+        .find(|entry| entry.eq_ignore_ascii_case(value))
+        .cloned()
+    else {
+        return false;
+    };
+    set.remove(&existing)
+}
+
+/// Route an incoming IRC protocol message to the appropriate handler,
+/// mutating `AppState` as needed.
+#[expect(
+    clippy::too_many_lines,
+    reason = "IRC command dispatcher — one arm per message type"
+)]
+pub fn handle_irc_message(state: &mut AppState, conn_id: &str, msg: &IrcMessage) {
+    let our_nick = state
+        .connections
+        .get(conn_id)
+        .map(|c| c.nick.clone())
+        .unwrap_or_default();
+
+    let tags = extract_tags(msg);
+
+    match &msg.command {
+        Command::PRIVMSG(target, text) => {
+            handle_privmsg(
+                state,
+                conn_id,
+                &our_nick,
+                msg.prefix.as_ref(),
+                target,
+                text,
+                tags,
+            );
+        }
+        Command::NOTICE(target, text) => {
+            handle_notice(state, conn_id, msg.prefix.as_ref(), target, text, tags);
+        }
+        Command::JOIN(channel, account, realname) => {
+            handle_join(
+                state,
+                conn_id,
+                &our_nick,
+                msg.prefix.as_ref(),
+                channel,
+                account.as_deref(),
+                realname.as_deref(),
+                tags,
+            );
+        }
+        Command::PART(channel, reason) => {
+            handle_part(
+                state,
+                conn_id,
+                &our_nick,
+                msg.prefix.as_ref(),
+                channel,
+                reason.as_deref(),
+                tags,
+            );
+        }
+        Command::QUIT(reason) => {
+            handle_quit(
+                state,
+                conn_id,
+                &our_nick,
+                msg.prefix.as_ref(),
+                reason.as_deref(),
+                tags,
+            );
+        }
+        Command::NICK(new_nick) => {
+            handle_nick_change(
+                state,
+                conn_id,
+                &our_nick,
+                msg.prefix.as_ref(),
+                new_nick,
+                tags,
+            );
+        }
+        Command::KICK(channel, kicked_user, reason) => {
+            handle_kick(
+                state,
+                conn_id,
+                &our_nick,
+                msg.prefix.as_ref(),
+                channel,
+                kicked_user,
+                reason.as_deref(),
+                tags,
+            );
+        }
+        Command::TOPIC(channel, topic) => {
+            handle_topic(
+                state,
+                conn_id,
+                msg.prefix.as_ref(),
+                channel,
+                topic.as_deref(),
+                tags,
+            );
+        }
+        Command::ChannelMODE(target, _) | Command::UserMODE(target, _) => {
+            handle_mode(state, conn_id, msg.prefix.as_ref(), target, msg, tags);
+        }
+        Command::INVITE(nick, channel) => {
+            handle_invite(
+                state,
+                conn_id,
+                &our_nick,
+                msg.prefix.as_ref(),
+                nick,
+                channel,
+                tags,
+            );
+        }
+        Command::Response(response, args) => {
+            handle_response(state, conn_id, *response, args);
+        }
+        Command::WALLOPS(text) => {
+            handle_wallops(state, conn_id, msg.prefix.as_ref(), text);
+        }
+        Command::ACCOUNT(account) => {
+            handle_account(state, conn_id, msg.prefix.as_ref(), account, tags);
+        }
+        Command::AWAY(reason) => {
+            handle_away(state, conn_id, msg.prefix.as_ref(), reason.as_deref());
+        }
+        Command::CHGHOST(new_user, new_host) => {
+            handle_chghost(
+                state,
+                conn_id,
+                msg.prefix.as_ref(),
+                new_user,
+                new_host,
+                tags,
+            );
+        }
+        Command::ERROR(message) => {
+            handle_error(state, conn_id, message);
+        }
+        // RPL_CREATIONTIME (329): channel creation timestamp.
+        // args = [our_nick, #channel, unix_timestamp]
+        #[allow(
+            clippy::collapsible_match,
+            reason = "must NOT collapse into the guard: a malformed 329 (args<3) is swallowed here, and folding the length check into the match guard would let it fall through to the generic-numeric arm and display junk"
+        )]
+        Command::Raw(cmd, args) if cmd == "329" => {
+            // A malformed 329 (fewer than 3 args) is intentionally swallowed
+            // here rather than falling through to the generic-numeric arm.
+            if args.len() >= 3 {
+                let channel = &args[1];
+                let silent = state.connections.get(conn_id).is_some_and(|conn| {
+                    contains_case_insensitive(&conn.silent_banlist_channels, channel)
+                });
+                if silent {
+                    return;
+                }
+                let buffer_id = make_buffer_id(conn_id, channel);
+                if let Ok(ts) = args[2].parse::<i64>() {
+                    let created = chrono::DateTime::from_timestamp(ts, 0).unwrap_or_else(Utc::now);
+                    let formatted = created
+                        .with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string();
+                    let id = state.next_message_id();
+                    state.add_message(
+                        &buffer_id,
+                        Message {
+                            id,
+                            timestamp: Utc::now(),
+                            message_type: MessageType::Event,
+                            nick: None,
+                            nick_mode: None,
+                            text: format!("Channel {channel} created {formatted}"),
+                            highlight: false,
+                            event_key: Some("channel_created".to_string()),
+                            // $0=channel, $1=formatted date
+                            event_params: Some(vec![channel.clone(), formatted]),
+                            log_msg_id: None,
+                            log_ref_id: None,
+                            tags: None,
+                        },
+                    );
+                }
+            }
+        }
+        // WHOX response (354) comes as Command::Raw because the irc crate
+        // doesn't recognize this non-standard numeric.
+        Command::Raw(cmd, args) if cmd == "354" => {
+            handle_whox_reply(state, conn_id, args);
+        }
+        Command::Raw(cmd, args) if cmd == "330" => {
+            handle_whois_account(state, conn_id, args);
+        }
+        Command::Raw(cmd, args) if cmd == "671" => {
+            handle_whois_secure(state, conn_id, args);
+        }
+        // Catch-all for unknown numerics that irc-proto doesn't define
+        // (e.g. IRCnet's 344/345 for reop list). Display them like the
+        // Response catch-all does — errors to active window, info to server.
+        Command::Raw(cmd, args) if cmd.len() == 3 && cmd.chars().all(|c| c.is_ascii_digit()) => {
+            // Unknown numerics are typically responses to user commands,
+            // so always route to the active window.
+            let buffer_id = active_or_server_buffer(state, conn_id);
+            let text = if args.len() > 1 {
+                args[1..].join(" ")
+            } else {
+                args.join(" ")
+            };
+            let id = state.next_message_id();
+            state.add_message(
+                &buffer_id,
+                Message {
+                    id,
+                    timestamp: Utc::now(),
+                    message_type: MessageType::Event,
+                    nick: None,
+                    nick_mode: None,
+                    text,
+                    highlight: false,
+                    event_key: None,
+                    event_params: None,
+                    log_msg_id: None,
+                    log_ref_id: None,
+                    tags: None,
+                },
+            );
+        }
+        // PING handled automatically by the irc crate
+        _ => {}
+    }
+}
+
+/// Update connection status to Connected and log to the status buffer.
+pub fn handle_connected(state: &mut AppState, conn_id: &str) {
+    state.update_connection_status(conn_id, ConnectionStatus::Connected);
+
+    // Reset reconnect state on successful connection.
+    // Reset ISUPPORT (server sends fresh 005 lines) and silent WHO state.
+    // Do NOT clear enabled_caps — the caller sets them from the CAP negotiation
+    // result (IrcEvent::Connected carries the negotiated caps). On reconnect,
+    // `conn.enabled_caps = enabled_caps` at the call site replaces the old set
+    // entirely, so stale caps from a previous session are already gone.
+    if let Some(conn) = state.connections.get_mut(conn_id) {
+        conn.reconnect_attempts = 0;
+        conn.next_reconnect = None;
+        conn.error = None;
+        conn.isupport_parsed = crate::irc::isupport::Isupport::default();
+        conn.silent_who_channels.clear();
+        conn.silent_banlist_channels.clear();
+    }
+
+    let label = state
+        .connections
+        .get(conn_id)
+        .map_or_else(|| conn_id.to_string(), |c| c.label.clone());
+    let buffer_id = make_buffer_id(conn_id, &label);
+
+    let id = state.next_message_id();
+    state.add_message(
+        &buffer_id,
+        Message {
+            id,
+            timestamp: Utc::now(),
+            message_type: MessageType::Event,
+            nick: None,
+            nick_mode: None,
+            text: format!("Connected to {label}"),
+            highlight: false,
+            event_key: Some("connected".to_string()),
+            event_params: None,
+            log_msg_id: None,
+            log_ref_id: None,
+            tags: None,
+        },
+    );
+}
+
+/// Get the list of channels to auto-rejoin after reconnecting.
+pub fn channels_to_rejoin(state: &AppState, conn_id: &str) -> Vec<String> {
+    // Collect channels from existing channel buffers for this connection
+    let mut channels: Vec<String> = state
+        .buffers
+        .values()
+        .filter(|b| {
+            b.connection_id == conn_id && b.buffer_type == crate::state::buffer::BufferType::Channel
+        })
+        .map(|b| b.name.clone())
+        .collect();
+
+    // Also include joined_channels from Connection state (in case buffers were cleaned up)
+    if let Some(conn) = state.connections.get(conn_id) {
+        for ch in &conn.joined_channels {
+            if !channels.contains(ch) {
+                channels.push(ch.clone());
+            }
+        }
+    }
+
+    channels
+}
+
+/// Update connection status to Disconnected and log to the status buffer.
+/// Also sets up reconnect timing if `should_reconnect` is true.
+///
+/// Channel nicklists are wiped here so they don't survive into a reconnect:
+/// when the server's auto-JOIN replays after reconnection, we receive a fresh
+/// `RPL_NAMREPLY` that rebuilds the list. Without this wipe, departed users
+/// from the previous session linger in `Buffer.users` forever (mirrors
+/// weechat's `irc_server.c:irc_nick_free_all` per-channel disconnect cleanup).
+pub fn handle_disconnected(state: &mut AppState, conn_id: &str, error: Option<&str>) {
+    // Save channel names AND wipe nicklists in one pass — channels survive the
+    // disconnect (we want to reuse the buffer + history on rejoin), but their
+    // user state is no longer authoritative.
+    let mut current_channels: Vec<String> = Vec::new();
+    for buf in state.buffers.values_mut() {
+        if buf.connection_id == conn_id
+            && buf.buffer_type == crate::state::buffer::BufferType::Channel
+        {
+            current_channels.push(buf.name.clone());
+            buf.users.clear();
+            buf.last_speakers.clear();
+        }
+    }
+
+    if let Some(err) = error {
+        if let Some(conn) = state.connections.get_mut(conn_id) {
+            conn.status = ConnectionStatus::Error;
+            conn.error = Some(err.to_string());
+        }
+    } else {
+        state.update_connection_status(conn_id, ConnectionStatus::Disconnected);
+    }
+
+    // Store joined channels and set up reconnect schedule
+    if let Some(conn) = state.connections.get_mut(conn_id) {
+        if !current_channels.is_empty() {
+            conn.joined_channels = current_channels;
+        }
+        if conn.should_reconnect {
+            let delay =
+                calculate_reconnect_delay(conn.reconnect_delay_secs, conn.reconnect_attempts);
+            conn.next_reconnect =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(delay));
+        }
+    }
+
+    let label = state
+        .connections
+        .get(conn_id)
+        .map_or_else(|| conn_id.to_string(), |c| c.label.clone());
+    let buffer_id = make_buffer_id(conn_id, &label);
+
+    let mut msg_text = error.map_or_else(
+        || format!("Disconnected from {label}"),
+        |e| format!("Disconnected from {label}: {e}"),
+    );
+
+    // Append reconnect info if applicable
+    if let Some(conn) = state.connections.get(conn_id)
+        && conn.should_reconnect
+    {
+        let delay = calculate_reconnect_delay(conn.reconnect_delay_secs, conn.reconnect_attempts);
+        let _ = write!(msg_text, " — reconnecting in {delay}s");
+    }
+
+    let id = state.next_message_id();
+    state.add_message(
+        &buffer_id,
+        Message {
+            id,
+            timestamp: Utc::now(),
+            message_type: MessageType::Event,
+            nick: None,
+            nick_mode: None,
+            text: msg_text,
+            highlight: false,
+            event_key: Some("disconnected".to_string()),
+            event_params: None,
+            log_msg_id: None,
+            log_ref_id: None,
+            tags: None,
+        },
+    );
+}
+
+/// Calculate reconnect delay with exponential backoff.
+///
+/// For the first 10 attempts, uses exponential backoff capped at 300s.
+/// After 10 attempts, switches to a fixed 600s (10min) interval.
+fn calculate_reconnect_delay(base_delay: u64, attempts: u32) -> u64 {
+    if attempts >= 10 {
+        return 600;
+    }
+    let delay = base_delay.saturating_mul(2u64.saturating_pow(attempts));
+    delay.min(300)
+}
+
+/// Extract a capabilities string from a `CAP` command's field3/field4.
+///
+/// The IRC protocol sends `CAP * <subcommand> :caps` which the irc crate parses
+/// as `CAP(Some("*"), subcmd, Some("caps"), None)`.  In some cases the caps may
+/// land in field4 instead (e.g. multiline continuation).  This helper checks both
+/// fields, skipping the `*` continuation marker.
+fn extract_cap_string(field3: Option<&str>, field4: Option<&str>) -> String {
+    // If field3 is "*" (continuation marker), caps are in field4
+    if field3 == Some("*") {
+        return field4.unwrap_or("").to_string();
+    }
+    // Otherwise try field4 first (some servers put caps there), then field3
+    if let Some(s) = field4
+        && !s.is_empty()
+    {
+        return s.to_string();
+    }
+    field3.unwrap_or("").to_string()
+}
+
+/// Handle `CAP NEW` — new capabilities became available at runtime.
+///
+/// Parses the caps string, filters to those in [`DESIRED_CAPS`] that are not
+/// already enabled, and returns the list of caps that should be requested via
+/// `CAP REQ`.  The caller is responsible for sending the actual `CAP REQ`
+/// command (since this function has no access to the IRC sender).
+///
+/// Also logs the event to the server status buffer.
+pub fn handle_cap_new(
+    state: &mut AppState,
+    conn_id: &str,
+    field3: Option<&str>,
+    field4: Option<&str>,
+) -> Vec<String> {
+    use crate::irc::cap::DESIRED_CAPS;
+
+    let caps_str = extract_cap_string(field3, field4);
+    let new_caps: Vec<String> = caps_str
+        .split_whitespace()
+        .map(|s| s.split_once('=').map_or(s, |(name, _)| name))
+        .map(str::to_ascii_lowercase)
+        .collect();
+
+    tracing::info!("CAP NEW from {conn_id}: {}", new_caps.join(" "));
+
+    let enabled = state.connections.get(conn_id).map(|c| &c.enabled_caps);
+
+    let to_request: Vec<String> = new_caps
+        .iter()
+        .filter(|cap| {
+            DESIRED_CAPS.iter().any(|d| d.eq_ignore_ascii_case(cap))
+                && enabled.is_none_or(|set| !set.contains(cap.as_str()))
+        })
+        .cloned()
+        .collect();
+
+    // Log to server status buffer
+    let label = state
+        .connections
+        .get(conn_id)
+        .map_or_else(|| conn_id.to_string(), |c| c.label.clone());
+    let buffer_id = make_buffer_id(conn_id, &label);
+
+    let text = if to_request.is_empty() {
+        format!(
+            "New capabilities available: {} (none requested)",
+            new_caps.join(", ")
+        )
+    } else {
+        format!(
+            "New capabilities available: {} — requesting: {}",
+            new_caps.join(", "),
+            to_request.join(", ")
+        )
+    };
+
+    let id = state.next_message_id();
+    state.add_message(
+        &buffer_id,
+        Message {
+            id,
+            timestamp: Utc::now(),
+            message_type: MessageType::Event,
+            nick: None,
+            nick_mode: None,
+            text,
+            highlight: false,
+            event_key: Some("cap_new".to_string()),
+            event_params: None,
+            log_msg_id: None,
+            log_ref_id: None,
+            tags: None,
+        },
+    );
+
+    to_request
+}
+
+/// Handle `CAP DEL` — capabilities removed by the server at runtime.
+///
+/// Parses the caps string and removes each from `conn.enabled_caps`.
+/// Logs the event to the server status buffer.
+pub fn handle_cap_del(
+    state: &mut AppState,
+    conn_id: &str,
+    field3: Option<&str>,
+    field4: Option<&str>,
+) {
+    let caps_str = extract_cap_string(field3, field4);
+    let removed_caps: Vec<String> = caps_str
+        .split_whitespace()
+        .map(|s| s.split_once('=').map_or(s, |(name, _)| name))
+        .map(str::to_ascii_lowercase)
+        .collect();
+
+    tracing::info!("CAP DEL from {conn_id}: {}", removed_caps.join(" "));
+
+    let mut actually_removed = Vec::new();
+    if let Some(conn) = state.connections.get_mut(conn_id) {
+        for cap in &removed_caps {
+            if conn.enabled_caps.remove(cap) {
+                actually_removed.push(cap.clone());
+            }
+        }
+    }
+
+    // Log to server status buffer
+    let label = state
+        .connections
+        .get(conn_id)
+        .map_or_else(|| conn_id.to_string(), |c| c.label.clone());
+    let buffer_id = make_buffer_id(conn_id, &label);
+
+    let text = if actually_removed.is_empty() {
+        format!(
+            "Capabilities removed: {} (none were enabled)",
+            removed_caps.join(", ")
+        )
+    } else {
+        format!("Capabilities removed: {}", actually_removed.join(", "))
+    };
+
+    let id = state.next_message_id();
+    state.add_message(
+        &buffer_id,
+        Message {
+            id,
+            timestamp: Utc::now(),
+            message_type: MessageType::Event,
+            nick: None,
+            nick_mode: None,
+            text,
+            highlight: false,
+            event_key: Some("cap_del".to_string()),
+            event_params: None,
+            log_msg_id: None,
+            log_ref_id: None,
+            tags: None,
+        },
+    );
+}
+
+/// Handle `CAP ACK` received at runtime (in response to a `CAP REQ` triggered
+/// by `CAP NEW`).
+///
+/// Adds the acknowledged capabilities to `conn.enabled_caps` and logs the event.
+pub fn handle_cap_ack(
+    state: &mut AppState,
+    conn_id: &str,
+    field3: Option<&str>,
+    field4: Option<&str>,
+) {
+    let caps_str = extract_cap_string(field3, field4);
+    let acked_caps: Vec<String> = caps_str
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect();
+
+    tracing::info!("CAP ACK from {conn_id}: {}", acked_caps.join(" "));
+
+    if let Some(conn) = state.connections.get_mut(conn_id) {
+        for cap in &acked_caps {
+            conn.enabled_caps.insert(cap.clone());
+        }
+    }
+
+    // Log to server status buffer
+    let label = state
+        .connections
+        .get(conn_id)
+        .map_or_else(|| conn_id.to_string(), |c| c.label.clone());
+    let buffer_id = make_buffer_id(conn_id, &label);
+
+    let text = format!("Capabilities acknowledged: {}", acked_caps.join(", "));
+
+    let id = state.next_message_id();
+    state.add_message(
+        &buffer_id,
+        Message {
+            id,
+            timestamp: Utc::now(),
+            message_type: MessageType::Event,
+            nick: None,
+            nick_mode: None,
+            text,
+            highlight: false,
+            event_key: Some("cap_ack".to_string()),
+            event_params: None,
+            log_msg_id: None,
+            log_ref_id: None,
+            tags: None,
+        },
+    );
+}
+
+/// Handle `CAP NAK` received at runtime (server refused our `CAP REQ`).
+///
+/// Logs the rejection to the server status buffer.
+pub fn handle_cap_nak(
+    state: &mut AppState,
+    conn_id: &str,
+    field3: Option<&str>,
+    field4: Option<&str>,
+) {
+    let caps_str = extract_cap_string(field3, field4);
+    let naked_caps: Vec<String> = caps_str
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect();
+
+    tracing::warn!("CAP NAK from {conn_id}: {}", naked_caps.join(" "));
+
+    let label = state
+        .connections
+        .get(conn_id)
+        .map_or_else(|| conn_id.to_string(), |c| c.label.clone());
+    let buffer_id = make_buffer_id(conn_id, &label);
+
+    let text = format!("Capabilities rejected: {}", naked_caps.join(", "));
+
+    let id = state.next_message_id();
+    state.add_message(
+        &buffer_id,
+        Message {
+            id,
+            timestamp: Utc::now(),
+            message_type: MessageType::Event,
+            nick: None,
+            nick_mode: None,
+            text,
+            highlight: false,
+            event_key: Some("cap_nak".to_string()),
+            event_params: None,
+            log_msg_id: None,
+            log_ref_id: None,
+            tags: None,
+        },
+    );
+}
+
+/// Look up a nick's highest mode prefix (e.g. `'@'`, `'+'`) from the buffer's user list.
+///
+/// Thin wrapper around [`AppState::nick_prefix`] for internal callers
+/// that use `.map(String::from)` when constructing `Message` structs.
+fn nick_prefix(state: &AppState, buffer_id: &str, nick: &str) -> Option<char> {
+    state.nick_prefix(buffer_id, nick)
+}
+
+/// Extract `IRCv3` message tags from an `irc::proto::Message`.
+///
+/// Tags with no value are omitted — only `key=value` pairs are returned.
+fn extract_tags(msg: &IrcMessage) -> Option<HashMap<String, String>> {
+    let tags = msg.tags.as_ref()?;
+    let map: HashMap<String, String> = tags
+        .iter()
+        .filter_map(|tag| Some((tag.0.clone(), tag.1.as_ref()?.clone())))
+        .collect();
+    if map.is_empty() { None } else { Some(map) }
+}
+
+/// Extract the timestamp from `IRCv3` `server-time` tag (`@time=...`).
+///
+/// If a valid RFC 3339 timestamp is present, use it; otherwise fall back to
+/// `Utc::now()`.  This is critical for bouncer/relay playback where messages
+/// arrive with historical timestamps.
+fn message_timestamp(tags: Option<&HashMap<String, String>>) -> DateTime<Utc> {
+    tags.and_then(|t| t.get("time"))
+        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+        .map_or_else(Utc::now, |dt| dt.with_timezone(&Utc))
+}
+
+// === Private handlers ===
+
+#[expect(clippy::too_many_lines, reason = "linear message handler")]
+fn handle_privmsg(
+    state: &mut AppState,
+    conn_id: &str,
+    our_nick: &str,
+    prefix: Option<&Prefix>,
+    target: &str,
+    text: &str,
+    tags: Option<HashMap<String, String>>,
+) {
+    let (nick, ident, host) = extract_nick_userhost(prefix);
+    let target_is_channel = is_channel(target);
+    let is_own = nick == our_nick;
+    let flood_exempt =
+        !is_own && matches_mask_patterns(&state.flood_exemptions, &nick, Some(&ident), Some(&host));
+
+    // For channels and echo-message echoes (is_own), the buffer is the
+    // target.  For incoming PMs the buffer is the sender's nick.  This
+    // ensures that when the server echoes our PM to "bob", it routes to the
+    // "bob" query buffer instead of creating one named after ourselves.
+    let buffer_name = if target_is_channel || is_own {
+        target
+    } else {
+        &nick
+    };
+    let buffer_id = make_buffer_id(conn_id, buffer_name);
+
+    // E2E decrypt: if this looks like an RPE2E01 wire-format line, swap
+    // `text` for the plaintext before any further processing. Strict handle
+    // check uses the raw server-stamped `ident@host`, so attackers cannot
+    // decrypt by spoofing a nick.
+    //
+    // Spec §6: the keyring context for a PM is `@<peer_handle>` (not the
+    // peer's nick), so two peers sharing a nick across different hosts
+    // live under separate session rows. For channels we pass the target
+    // through unchanged. `context_key` encapsulates both cases.
+    let sender_handle = format!("{ident}@{host}");
+    let decrypt_context = crate::e2e::context_key(target, &sender_handle);
+    let decrypted_owned = try_decrypt_e2e(
+        state,
+        conn_id,
+        &nick,
+        &sender_handle,
+        &decrypt_context,
+        text,
+        is_own,
+    );
+    // An empty return from `try_decrypt_e2e` means "own echo-message
+    // echo of our own encrypted PRIVMSG — already rendered locally by
+    // `handle_plain_message`, drop the echo entirely". This path only
+    // triggers when `is_own` is true and the wire is `+RPE2E01…`.
+    if decrypted_owned.as_deref() == Some("") {
+        return;
+    }
+    let text: &str = decrypted_owned.as_deref().unwrap_or(text);
+
+    // Check if this is a CTCP (ACTION or other)
+    let is_ctcp = text.starts_with('\x01') && text.ends_with('\x01');
+    let is_action = is_ctcp && text.len() > 2 && text[1..text.len() - 1].starts_with("ACTION ");
+
+    // --- Ignore check ---
+    {
+        let ignore_level = if is_action {
+            IgnoreLevel::Actions
+        } else if is_ctcp {
+            IgnoreLevel::Ctcps
+        } else if target_is_channel {
+            IgnoreLevel::Public
+        } else {
+            IgnoreLevel::Msgs
+        };
+        let channel = if target_is_channel {
+            Some(target)
+        } else {
+            None
+        };
+        if should_ignore(
+            &state.ignores,
+            &nick,
+            Some(&ident),
+            Some(&host),
+            &ignore_level,
+            channel,
+        ) {
+            return;
+        }
+    }
+
+    // Create query buffer if it doesn't exist for PMs. When we create or
+    // find a Query buffer we also stamp `peer_handle` with the raw
+    // `ident@host` from the prefix — the E2E layer uses this to key PM
+    // session rows under `@<peer_handle>` instead of bare nick (spec §6).
+    if !target_is_channel && !state.buffers.contains_key(&buffer_id) {
+        state.add_buffer(Buffer {
+            id: buffer_id.clone(),
+            connection_id: conn_id.to_string(),
+            buffer_type: BufferType::Query,
+            name: nick.clone(),
+            messages: VecDeque::new(),
+            activity: ActivityLevel::None,
+            unread_count: 0,
+            last_read: Utc::now(),
+            topic: None,
+            topic_set_by: None,
+            users: std::collections::HashMap::new(),
+            modes: None,
+            mode_params: None,
+            list_modes: std::collections::HashMap::new(),
+            last_speakers: Vec::new(),
+            peer_handle: if is_own {
+                None
+            } else {
+                Some(format!("{ident}@{host}"))
+            },
+            log_total_lines: None,
+            log_oldest_ts: None,
+            log_newest_ts: None,
+            history_exhausted: false,
+            log_initial_loaded: false,
+        });
+    }
+
+    // Keep the Query buffer's `peer_handle` in sync with the latest
+    // server-stamped userhost. This matters when the peer reconnects from
+    // a new host — later messages will arrive with a different
+    // `ident@host`, and the cached handle must track it so the encrypt
+    // path picks up the new pseudochannel key. Never overwrite with
+    // `is_own` (echo-message) because that carries our own host.
+    if !target_is_channel
+        && !is_own
+        && let Some(buf) = state.buffers.get_mut(&buffer_id)
+    {
+        let new_handle = format!("{ident}@{host}");
+        if buf.peer_handle.as_deref() != Some(new_handle.as_str()) {
+            buf.peer_handle = Some(new_handle);
+        }
+    }
+
+    // account-tag: update NickEntry.account from message tags (supplementary)
+    if let Some(tag_account) = tags.as_ref().and_then(|t| t.get("account")) {
+        let account = if tag_account == "*" {
+            None
+        } else {
+            Some(tag_account.clone())
+        };
+        if target_is_channel
+            && let Some(buf) = state.buffers.get_mut(&buffer_id)
+            && let Some(entry) = buf.users.get_mut(&nick.to_lowercase())
+        {
+            entry.account.clone_from(&account);
+        }
+    }
+
+    // Check if this is a CTCP ACTION
+    if is_ctcp {
+        let inner = &text[1..text.len() - 1];
+        if let Some(action_text) = inner.strip_prefix("ACTION ") {
+            let is_mention = !is_own
+                && strip_irc_formatting(action_text)
+                    .to_lowercase()
+                    .contains(&our_nick.to_lowercase());
+            let activity = if is_own {
+                ActivityLevel::None
+            } else if !target_is_channel || is_mention {
+                ActivityLevel::Mention
+            } else {
+                ActivityLevel::Activity
+            };
+            let mode_prefix = nick_prefix(state, &buffer_id, &nick);
+            let id = state.next_message_id();
+            let ts = message_timestamp(tags.as_ref());
+            // Save nick before moving into Message — needed for mentions buffer below.
+            let nick_saved = if is_mention { Some(nick.clone()) } else { None };
+            state.add_message_with_activity(
+                &buffer_id,
+                Message {
+                    id,
+                    timestamp: ts,
+                    message_type: MessageType::Action,
+                    nick: Some(nick),
+                    nick_mode: mode_prefix.map(String::from),
+                    text: action_text.to_string(),
+                    highlight: is_mention,
+                    event_key: None,
+                    event_params: None,
+                    log_msg_id: None,
+                    log_ref_id: None,
+                    tags,
+                },
+                activity,
+            );
+
+            // Push to mentions buffer — channel highlights only.
+            if is_mention && target_is_channel && state.buffers.contains_key("_mentions") {
+                let nick = nick_saved.unwrap_or_default();
+                let conn_label = state
+                    .connections
+                    .get(conn_id)
+                    .map_or(conn_id, |c| c.label.as_str());
+                let datetime = ts
+                    .with_timezone(&chrono::Local)
+                    .format("%Y/%m/%d %H:%M:%S")
+                    .to_string();
+                let action_body = format!("* {nick} {action_text}");
+                let mention_text = crate::ui::format_mention_line(
+                    &datetime,
+                    conn_label,
+                    target,
+                    &nick,
+                    &action_body,
+                    state.nick_color_sat,
+                    state.nick_color_lit,
+                );
+                let mention_msg = Message {
+                    id: state.next_message_id(),
+                    timestamp: ts,
+                    message_type: MessageType::MentionLog,
+                    nick: None,
+                    nick_mode: None,
+                    text: mention_text,
+                    highlight: true,
+                    event_key: None,
+                    event_params: None,
+                    log_msg_id: None,
+                    log_ref_id: None,
+                    tags: None,
+                };
+                state.add_mention_to_buffer(mention_msg);
+            }
+
+            return;
+        }
+
+        // Other CTCP — flood check
+        if state.flood_protection && !flood_exempt {
+            let now = Instant::now();
+            let result = state.flood_state.check_ctcp_flood(now);
+            if result.suppressed() {
+                if result == crate::irc::flood::FloodResult::Triggered {
+                    emit(state, &buffer_id, "CTCP flood detected — suppressing");
+                }
+                return;
+            }
+        }
+        // RPE2E handshake CTCP dispatch. Some IRC servers strip trailing
+        // CTCP framing from NOTICE; accepting RPEE2E in PRIVMSG as well
+        // gives us a fallback path that still works on those servers.
+        if try_dispatch_rpe2e_ctcp(state, conn_id, prefix, target, text)
+            == Some(RpEe2eOutcome::Handled)
+        {
+            return;
+        }
+        // Non-ACTION CTCP, ignore for now
+        return;
+    }
+
+    // --- Flood checks for regular messages ---
+    if state.flood_protection && nick != our_nick && !flood_exempt {
+        let now = Instant::now();
+
+        if ident.starts_with('~') {
+            // Per-nick tilde rate limit — blocks only the flooding nick
+            let result = state.flood_state.check_tilde_nick_flood(&nick, now);
+            if result.suppressed() {
+                if result == crate::irc::flood::FloodResult::Triggered {
+                    emit(
+                        state,
+                        &buffer_id,
+                        &format!("Flood from {nick} detected — suppressing"),
+                    );
+                }
+                return;
+            }
+
+            // PM tilde storm — many unique ~ nicks PMing us = botnet
+            if !target_is_channel {
+                let storm = state.flood_state.check_pm_tilde_storm(&nick, now);
+                if storm.suppressed() {
+                    if storm == crate::irc::flood::FloodResult::Triggered {
+                        emit(
+                            state,
+                            &buffer_id,
+                            "PM flood storm detected — suppressing all ~ PMs",
+                        );
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Duplicate text flood check (channel messages only)
+        let dup_result = state
+            .flood_state
+            .check_duplicate_flood(text, target_is_channel, now);
+        if dup_result.suppressed() {
+            if dup_result == crate::irc::flood::FloodResult::Triggered {
+                emit(
+                    state,
+                    &buffer_id,
+                    "Duplicate text flood detected — suppressing",
+                );
+            }
+            return;
+        }
+    }
+
+    let is_mention = !is_own
+        && strip_irc_formatting(text)
+            .to_lowercase()
+            .contains(&our_nick.to_lowercase());
+
+    let activity = if is_own {
+        ActivityLevel::None
+    } else if !target_is_channel || is_mention {
+        ActivityLevel::Mention // PMs and mentions are mention-level
+    } else {
+        ActivityLevel::Activity
+    };
+
+    let mode_prefix = nick_prefix(state, &buffer_id, &nick);
+    let id = state.next_message_id();
+    let ts = message_timestamp(tags.as_ref());
+    // Save nick before moving into Message — needed for mentions buffer below.
+    let nick_saved = if is_mention { Some(nick.clone()) } else { None };
+    state.add_message_with_activity(
+        &buffer_id,
+        Message {
+            id,
+            timestamp: ts,
+            message_type: MessageType::Message,
+            nick: Some(nick),
+            nick_mode: mode_prefix.map(String::from),
+            text: text.to_string(),
+            highlight: is_mention,
+            event_key: None,
+            event_params: None,
+            log_msg_id: None,
+            log_ref_id: None,
+            tags,
+        },
+        activity,
+    );
+
+    // Push to mentions buffer — channel highlights only (not PMs/queries).
+    if is_mention && target_is_channel && state.buffers.contains_key("_mentions") {
+        let nick = nick_saved.unwrap_or_default();
+        let conn_label = state
+            .connections
+            .get(conn_id)
+            .map_or(conn_id, |c| c.label.as_str());
+        let datetime = ts
+            .with_timezone(&chrono::Local)
+            .format("%Y/%m/%d %H:%M:%S")
+            .to_string();
+        let mention_text = crate::ui::format_mention_line(
+            &datetime,
+            conn_label,
+            target,
+            &nick,
+            text,
+            state.nick_color_sat,
+            state.nick_color_lit,
+        );
+        let mention_msg = Message {
+            id: state.next_message_id(),
+            timestamp: ts,
+            message_type: MessageType::MentionLog,
+            nick: None,
+            nick_mode: None,
+            text: mention_text,
+            highlight: true,
+            event_key: None,
+            event_params: None,
+            log_msg_id: None,
+            log_ref_id: None,
+            tags: None,
+        };
+        state.add_mention_to_buffer(mention_msg);
+    }
+}
+
+fn handle_notice(
+    state: &mut AppState,
+    conn_id: &str,
+    prefix: Option<&Prefix>,
+    target: &str,
+    text: &str,
+    tags: Option<HashMap<String, String>>,
+) {
+    let nick = extract_nick(prefix);
+    // Server notices or pre-registration notices go to status buffer
+    let is_server_notice = nick.is_none() || is_server_prefix(prefix);
+
+    // --- Ignore check (skip for server notices) ---
+    if !is_server_notice {
+        let (n, ident, host) = extract_nick_userhost(prefix);
+        let channel = if is_channel(target) {
+            Some(target)
+        } else {
+            None
+        };
+        if should_ignore(
+            &state.ignores,
+            &n,
+            Some(&ident),
+            Some(&host),
+            &IgnoreLevel::Notices,
+            channel,
+        ) {
+            return;
+        }
+    }
+
+    // RPE2E handshake CTCP dispatch. Travels in NOTICE as
+    // `\x01RPEE2E ... \x01`. We intercept before the NOTICE becomes a
+    // user-visible buffer line so the raw CTCP never leaks into the UI.
+    if try_dispatch_rpe2e_ctcp(state, conn_id, prefix, target, text) == Some(RpEe2eOutcome::Handled)
+    {
+        return;
+    }
+
+    // echo-message: when the server echoes our own notice to a user, the
+    // target is the recipient (e.g. "bob"). Route to that buffer, not ours.
+    let our_nick = state
+        .connections
+        .get(conn_id)
+        .map(|c| c.nick.as_str())
+        .unwrap_or_default();
+    let is_own = nick.as_deref() == Some(our_nick);
+
+    // For channel notices and echo-message echoes (is_own), the buffer is
+    // the target.  For incoming user notices the buffer is the sender's nick.
+    let buffer_name = if is_server_notice {
+        state
+            .connections
+            .get(conn_id)
+            .map_or("Status", |c| c.label.as_str())
+    } else if is_channel(target) || is_own {
+        target
+    } else {
+        nick.as_deref().unwrap_or("Status")
+    };
+
+    let buffer_id = make_buffer_id(conn_id, buffer_name);
+    // Fallback to server buffer if target buffer doesn't exist
+    let buffer_id = if state.buffers.contains_key(&buffer_id) {
+        buffer_id
+    } else {
+        let label = state
+            .connections
+            .get(conn_id)
+            .map_or("Status", |c| c.label.as_str());
+        make_buffer_id(conn_id, label)
+    };
+
+    let mode_prefix = nick
+        .as_deref()
+        .and_then(|n| nick_prefix(state, &buffer_id, n));
+    let id = state.next_message_id();
+    state.add_message(
+        &buffer_id,
+        Message {
+            id,
+            timestamp: message_timestamp(tags.as_ref()),
+            message_type: MessageType::Notice,
+            nick,
+            nick_mode: mode_prefix.map(String::from),
+            text: text.to_string(),
+            highlight: false,
+            event_key: None,
+            event_params: None,
+            log_msg_id: None,
+            log_ref_id: None,
+            tags,
+        },
+    );
+}
+
+#[expect(clippy::too_many_arguments, clippy::too_many_lines)]
+fn handle_join(
+    state: &mut AppState,
+    conn_id: &str,
+    our_nick: &str,
+    prefix: Option<&Prefix>,
+    channel: &str,
+    extended_account: Option<&str>,
+    extended_realname: Option<&str>,
+    tags: Option<HashMap<String, String>>,
+) {
+    let (nick, ident, host) = extract_nick_userhost(prefix);
+    let buffer_id = make_buffer_id(conn_id, channel);
+
+    // extended-join: account from second JOIN arg ("*" means not logged in)
+    let account = match extended_account {
+        Some("*") | None => None,
+        Some(a) => Some(a.to_string()),
+    };
+
+    // account-tag: supplementary source (only if extended-join didn't provide one)
+    let account = account.or_else(|| {
+        tags.as_ref()
+            .and_then(|t| t.get("account"))
+            .and_then(|a| if a == "*" { None } else { Some(a.clone()) })
+    });
+
+    // extended-join: realname from third JOIN arg
+    let realname = extended_realname.unwrap_or("");
+
+    // --- Ignore check (never ignore our own joins) ---
+    if nick != our_nick
+        && should_ignore(
+            &state.ignores,
+            &nick,
+            Some(&ident),
+            Some(&host),
+            &IgnoreLevel::Joins,
+            Some(channel),
+        )
+    {
+        // Still add to nick list so channel state is correct, but suppress the message
+        state.add_nick(
+            &buffer_id,
+            NickEntry {
+                nick: nick.clone(),
+                prefix: String::new(),
+                modes: String::new(),
+                away: false,
+                account,
+                ident: None,
+                host: None,
+            },
+        );
+        return;
+    }
+
+    if nick == our_nick {
+        // Defense-in-depth nicklist reset (mirrors weechat irc-protocol.c:1755-1802):
+        // a buffer that already has users means this is a duplicate self-JOIN
+        // (ZNC bouncer replays JOIN without an intervening disconnect, /sajoin
+        // when already on the channel) — skip it. Otherwise the buffer is
+        // either fresh or was wiped by `handle_disconnected`; reset any stale
+        // topic/modes/list-modes so the upcoming RPL_TOPIC / RPL_CHANNELMODEIS
+        // / RPL_BANLIST replies repopulate from authoritative server state.
+        let exists = state.buffers.contains_key(&buffer_id);
+        let has_users = exists
+            && state
+                .buffers
+                .get(&buffer_id)
+                .is_some_and(|b| !b.users.is_empty());
+        if exists && has_users {
+            return;
+        }
+        if exists {
+            if let Some(buf) = state.buffers.get_mut(&buffer_id) {
+                buf.users.clear();
+                buf.last_speakers.clear();
+                buf.topic = None;
+                buf.topic_set_by = None;
+                buf.modes = None;
+                buf.mode_params = None;
+                buf.list_modes.clear();
+            }
+        } else {
+            state.add_buffer(Buffer {
+                id: buffer_id.clone(),
+                connection_id: conn_id.to_string(),
+                buffer_type: BufferType::Channel,
+                name: channel.to_string(),
+                messages: VecDeque::new(),
+                activity: ActivityLevel::None,
+                unread_count: 0,
+                last_read: Utc::now(),
+                topic: None,
+                topic_set_by: None,
+                users: std::collections::HashMap::new(),
+                modes: None,
+                mode_params: None,
+                list_modes: std::collections::HashMap::new(),
+                last_speakers: Vec::new(),
+                peer_handle: None,
+                log_total_lines: None,
+                log_oldest_ts: None,
+                log_newest_ts: None,
+                history_exhausted: false,
+                log_initial_loaded: false,
+            });
+        }
+        state.set_active_buffer(&buffer_id);
+    } else {
+        // Someone else joined — add to nick list
+        state.add_nick(
+            &buffer_id,
+            NickEntry {
+                nick: nick.clone(),
+                prefix: String::new(),
+                modes: String::new(),
+                away: false,
+                account: account.clone(),
+                ident: None,
+                host: None,
+            },
+        );
+        state
+            .pending_web_events
+            .push(crate::web::protocol::WebEvent::NickEvent {
+                buffer_id: buffer_id.clone(),
+                kind: crate::web::protocol::NickEventKind::Join,
+                nick: nick.clone(),
+                new_nick: None,
+                prefix: Some(String::new()),
+                modes: Some(String::new()),
+                away: Some(false),
+                message: None,
+            });
+
+        // --- Netsplit: check if this is a netjoin ---
+        if state.netsplit_state.handle_join(&nick, &buffer_id) {
+            // Suppress normal join message — netsplit module will batch it
+            return;
+        }
+    }
+
+    // extended-join: show account and realname in join message when available
+    let account_display = account
+        .as_deref()
+        .map_or(String::new(), |a| format!("[{a}]"));
+    let realname_display = if realname.is_empty() {
+        String::new()
+    } else {
+        realname.to_string()
+    };
+
+    let id = state.next_message_id();
+    state.add_message(
+        &buffer_id,
+        Message {
+            id,
+            timestamp: message_timestamp(tags.as_ref()),
+            message_type: MessageType::Event,
+            nick: None,
+            nick_mode: None,
+            text: format!(
+                "{nick} ({ident}@{host}) has joined {channel} {account_display} {realname_display}"
+            ),
+            highlight: false,
+            event_key: Some("join".to_string()),
+            // $0=nick, $1=ident, $2=host, $3=channel, $4=account, $5=realname
+            event_params: Some(vec![
+                nick,
+                ident,
+                host,
+                channel.to_string(),
+                account_display,
+                realname_display,
+            ]),
+            log_msg_id: None,
+            log_ref_id: None,
+            tags,
+        },
+    );
+}
+
+/// Update a nick's `account` field in every buffer on a given connection that
+/// contains that nick.  Used by `account-notify` and `account-tag`.
+fn update_nick_account_in_buffers(
+    state: &mut AppState,
+    conn_id: &str,
+    nick: &str,
+    account: Option<&str>,
+) {
+    let nick_lower = nick.to_lowercase();
+    for buf in state.buffers.values_mut() {
+        if buf.connection_id != conn_id {
+            continue;
+        }
+        if let Some(entry) = buf.users.get_mut(&nick_lower) {
+            entry.account = account.map(str::to_string);
+        }
+    }
+}
+
+/// Handle `IRCv3` `account-notify`: `:nick!user@host ACCOUNT account_name`
+///
+/// When a user logs in or out of their NickServ/services account the server
+/// sends this command to every channel we share with them.
+///   - `account == "*"` → logged out (clear account)
+///   - otherwise → logged in as `account`
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tags follows the convention of all other event handlers"
+)]
+fn handle_account(
+    state: &mut AppState,
+    conn_id: &str,
+    prefix: Option<&Prefix>,
+    account: &str,
+    tags: Option<HashMap<String, String>>,
+) {
+    let Some(nick) = extract_nick(prefix) else {
+        return;
+    };
+
+    let resolved: Option<&str> = if account == "*" { None } else { Some(account) };
+
+    update_nick_account_in_buffers(state, conn_id, &nick, resolved);
+
+    // Log a subtle event in every shared channel
+    let shared_buffers: Vec<String> = state
+        .buffers
+        .values()
+        .filter(|b| {
+            b.connection_id == conn_id
+                && b.buffer_type == BufferType::Channel
+                && b.users.contains_key(&nick.to_lowercase())
+        })
+        .map(|b| b.id.clone())
+        .collect();
+
+    let (text, description) = resolved.map_or_else(
+        || {
+            (
+                format!("{nick} has logged out"),
+                "has logged out".to_string(),
+            )
+        },
+        |acct| {
+            (
+                format!("{nick} is now logged in as {acct}"),
+                format!("is now logged in as {acct}"),
+            )
+        },
+    );
+
+    for buf_id in shared_buffers {
+        let id = state.next_message_id();
+        state.add_message(
+            &buf_id,
+            Message {
+                id,
+                timestamp: message_timestamp(tags.as_ref()),
+                message_type: MessageType::Event,
+                nick: None,
+                nick_mode: None,
+                text: text.clone(),
+                highlight: false,
+                event_key: Some("account".to_string()),
+                event_params: Some(vec![nick.clone(), description.clone()]),
+                log_msg_id: None,
+                log_ref_id: None,
+                tags: tags.clone(),
+            },
+        );
+    }
+}
+
+/// Handle `IRCv3` `away-notify`: `:nick!user@host AWAY :reason` or `:nick!user@host AWAY`
+///
+/// When a user changes their away status, the server sends AWAY to every
+/// channel we share with them.
+///   - `reason == Some(text)` → user is away
+///   - `reason == None` → user is back
+///
+/// We silently update `NickEntry.away` without adding event messages (too noisy).
+fn handle_away(state: &mut AppState, conn_id: &str, prefix: Option<&Prefix>, reason: Option<&str>) {
+    let Some(nick) = extract_nick(prefix) else {
+        return;
+    };
+
+    let is_away = reason.is_some();
+    let nick_lower = nick.to_lowercase();
+
+    let affected_bufs: Vec<String> = state
+        .buffers
+        .iter()
+        .filter(|(_, buf)| buf.connection_id == conn_id && buf.users.contains_key(&nick_lower))
+        .map(|(id, _)| id.clone())
+        .collect();
+
+    for buf in state.buffers.values_mut() {
+        if buf.connection_id != conn_id {
+            continue;
+        }
+        if let Some(entry) = buf.users.get_mut(&nick_lower) {
+            entry.away = is_away;
+        }
+    }
+
+    for buf_id in affected_bufs {
+        state
+            .pending_web_events
+            .push(crate::web::protocol::WebEvent::NickEvent {
+                buffer_id: buf_id,
+                kind: crate::web::protocol::NickEventKind::AwayChange,
+                nick: nick.clone(),
+                new_nick: None,
+                prefix: None,
+                modes: None,
+                away: Some(is_away),
+                message: reason.map(ToString::to_string),
+            });
+    }
+}
+
+/// Handle `IRCv3` `chghost`: `:nick!olduser@oldhost CHGHOST newuser newhost`
+///
+/// When a user's ident or hostname changes, the server sends CHGHOST to every
+/// channel we share with them. We update the `NickEntry` and add a subtle event
+/// message.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tags follows the convention of all other event handlers"
+)]
+fn handle_chghost(
+    state: &mut AppState,
+    conn_id: &str,
+    prefix: Option<&Prefix>,
+    new_user: &str,
+    new_host: &str,
+    tags: Option<HashMap<String, String>>,
+) {
+    let Some(nick) = extract_nick(prefix) else {
+        return;
+    };
+
+    let nick_lower = nick.to_lowercase();
+
+    // Update ident/host in all shared buffers
+    for buf in state.buffers.values_mut() {
+        if buf.connection_id != conn_id {
+            continue;
+        }
+        if let Some(entry) = buf.users.get_mut(&nick_lower) {
+            entry.ident = Some(new_user.to_string());
+            entry.host = Some(new_host.to_string());
+        }
+    }
+
+    // Log a subtle event in every shared channel
+    let shared_buffers: Vec<String> = state
+        .buffers
+        .values()
+        .filter(|b| {
+            b.connection_id == conn_id
+                && b.buffer_type == BufferType::Channel
+                && b.users.contains_key(&nick_lower)
+        })
+        .map(|b| b.id.clone())
+        .collect();
+
+    let text = format!("{nick} changed host to {new_user}@{new_host}");
+
+    for buf_id in shared_buffers {
+        let id = state.next_message_id();
+        state.add_message(
+            &buf_id,
+            Message {
+                id,
+                timestamp: message_timestamp(tags.as_ref()),
+                message_type: MessageType::Event,
+                nick: None,
+                nick_mode: None,
+                text: text.clone(),
+                highlight: false,
+                event_key: Some("chghost".to_string()),
+                event_params: Some(vec![
+                    nick.clone(),
+                    new_user.to_string(),
+                    new_host.to_string(),
+                ]),
+                log_msg_id: None,
+                log_ref_id: None,
+                tags: tags.clone(),
+            },
+        );
+    }
+}
+
+fn handle_part(
+    state: &mut AppState,
+    conn_id: &str,
+    our_nick: &str,
+    prefix: Option<&Prefix>,
+    channel: &str,
+    reason: Option<&str>,
+    tags: Option<HashMap<String, String>>,
+) {
+    let (nick, ident, host) = extract_nick_userhost(prefix);
+    let buffer_id = make_buffer_id(conn_id, channel);
+
+    if nick == our_nick {
+        state.remove_buffer(&buffer_id);
+        // Clean up any pending silent WHO for this channel.
+        if let Some(conn) = state.connections.get_mut(conn_id) {
+            remove_case_insensitive(&mut conn.silent_who_channels, channel);
+            remove_case_insensitive(&mut conn.silent_banlist_channels, channel);
+        }
+    } else {
+        // Always update nick list regardless of ignore
+        state.remove_nick(&buffer_id, &nick);
+        state
+            .pending_web_events
+            .push(crate::web::protocol::WebEvent::NickEvent {
+                buffer_id: buffer_id.clone(),
+                kind: crate::web::protocol::NickEventKind::Part,
+                nick: nick.clone(),
+                new_nick: None,
+                prefix: None,
+                modes: None,
+                away: None,
+                message: reason.map(ToString::to_string),
+            });
+
+        // --- Ignore check ---
+        if should_ignore(
+            &state.ignores,
+            &nick,
+            Some(&ident),
+            Some(&host),
+            &IgnoreLevel::Parts,
+            Some(channel),
+        ) {
+            return;
+        }
+
+        let reason_str = reason.unwrap_or("");
+        let id = state.next_message_id();
+        state.add_message(
+            &buffer_id,
+            Message {
+                id,
+                timestamp: message_timestamp(tags.as_ref()),
+                message_type: MessageType::Event,
+                nick: None,
+                nick_mode: None,
+                text: format!("{nick} ({ident}@{host}) has left {channel} ({reason_str})"),
+                highlight: false,
+                event_key: Some("part".to_string()),
+                event_params: Some(vec![
+                    nick,
+                    ident,
+                    host,
+                    channel.to_string(),
+                    reason_str.to_string(),
+                ]),
+                log_msg_id: None,
+                log_ref_id: None,
+                tags,
+            },
+        );
+    }
+}
+
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tags are dropped when ignored/netsplit, cloned into fan-out Messages otherwise"
+)]
+fn handle_quit(
+    state: &mut AppState,
+    conn_id: &str,
+    _our_nick: &str,
+    prefix: Option<&Prefix>,
+    reason: Option<&str>,
+    tags: Option<HashMap<String, String>>,
+) {
+    let (nick, ident, host) = extract_nick_userhost(prefix);
+    let reason_str = reason.unwrap_or("");
+
+    // Remove from all buffers on this connection
+    let affected: Vec<String> = state
+        .buffers
+        .iter()
+        .filter(|(_, buf)| {
+            buf.connection_id == conn_id && buf.users.contains_key(&nick.to_lowercase())
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+
+    // Always remove from nick lists regardless of ignore/netsplit
+    for buf_id in &affected {
+        state.remove_nick(buf_id, &nick);
+        state
+            .pending_web_events
+            .push(crate::web::protocol::WebEvent::NickEvent {
+                buffer_id: buf_id.clone(),
+                kind: crate::web::protocol::NickEventKind::Quit,
+                nick: nick.clone(),
+                new_nick: None,
+                prefix: None,
+                modes: None,
+                away: None,
+                message: reason.map(ToString::to_string),
+            });
+    }
+
+    // --- Ignore check ---
+    if should_ignore(
+        &state.ignores,
+        &nick,
+        Some(&ident),
+        Some(&host),
+        &IgnoreLevel::Quits,
+        None,
+    ) {
+        return;
+    }
+
+    // --- Netsplit check ---
+    if state
+        .netsplit_state
+        .handle_quit(&nick, reason_str, &affected)
+    {
+        // Suppress normal quit messages — netsplit module will batch them
+        return;
+    }
+
+    // First channel gets the full log row; remaining channels get reference rows.
+    let primary_msg_id = uuid::Uuid::new_v4().to_string();
+    let text = format!("{nick} ({ident}@{host}) has quit ({reason_str})");
+
+    let ts = message_timestamp(tags.as_ref());
+    for (i, buf_id) in affected.iter().enumerate() {
+        let id = state.next_message_id();
+        state.add_message(
+            buf_id,
+            Message {
+                id,
+                timestamp: ts,
+                message_type: MessageType::Event,
+                nick: None,
+                nick_mode: None,
+                text: text.clone(),
+                highlight: false,
+                event_key: Some("quit".to_string()),
+                event_params: Some(vec![
+                    nick.clone(),
+                    ident.clone(),
+                    host.clone(),
+                    reason_str.to_string(),
+                ]),
+                log_msg_id: if i == 0 {
+                    Some(primary_msg_id.clone())
+                } else {
+                    None
+                },
+                log_ref_id: if i == 0 {
+                    None
+                } else {
+                    Some(primary_msg_id.clone())
+                },
+                tags: tags.clone(),
+            },
+        );
+    }
+}
+
+/// Rename query buffers in `affected` to `new_nick`.
+/// Re-keys the buffer in the `IndexMap` and updates `active_buffer_id`.
+fn rename_query_buffers(state: &mut AppState, conn_id: &str, new_nick: &str, affected: &[String]) {
+    for buf_id in affected {
+        let is_query = state
+            .buffers
+            .get(buf_id)
+            .is_some_and(|b| b.buffer_type == BufferType::Query);
+        if !is_query {
+            continue;
+        }
+        let new_buf_id = make_buffer_id(conn_id, new_nick);
+        if let Some(mut buf) = state.buffers.shift_remove(buf_id) {
+            buf.name = new_nick.to_string();
+            buf.id.clone_from(&new_buf_id);
+            state.buffers.insert(new_buf_id.clone(), buf);
+            if state.active_buffer_id.as_deref() == Some(buf_id.as_str()) {
+                state.active_buffer_id = Some(new_buf_id);
+            }
+        }
+    }
+}
+
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tags are cloned into each fan-out Message"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "nick change fan-out + web NickEvent broadcasting"
+)]
+fn handle_nick_change(
+    state: &mut AppState,
+    conn_id: &str,
+    our_nick: &str,
+    prefix: Option<&Prefix>,
+    new_nick: &str,
+    tags: Option<HashMap<String, String>>,
+) {
+    let old_nick = extract_nick(prefix).unwrap_or_default();
+
+    // Update our own nick if it's us
+    if old_nick == our_nick
+        && let Some(conn) = state.connections.get_mut(conn_id)
+    {
+        conn.nick = new_nick.to_string();
+        // Broadcast to web so status bar updates.
+        state
+            .pending_web_events
+            .push(crate::web::protocol::WebEvent::ConnectionStatus {
+                conn_id: conn_id.to_string(),
+                label: conn.label.clone(),
+                connected: conn.status == crate::state::connection::ConnectionStatus::Connected,
+                nick: new_nick.to_string(),
+            });
+    }
+
+    // --- Ignore check (never ignore our own nick changes) ---
+    if old_nick != our_nick {
+        let (_, ident, host) = extract_nick_userhost(prefix);
+        if should_ignore(
+            &state.ignores,
+            &old_nick,
+            Some(&ident),
+            Some(&host),
+            &IgnoreLevel::Nicks,
+            None,
+        ) {
+            // Still update nick list and rename query buffers so state is
+            // correct, but suppress the notification message.
+            let old_nick_lower = old_nick.to_lowercase();
+            let affected: Vec<String> = state
+                .buffers
+                .iter()
+                .filter(|(_, buf)| {
+                    buf.connection_id == conn_id
+                        && (buf.users.contains_key(&old_nick_lower)
+                            || (buf.buffer_type == BufferType::Query
+                                && buf.name.to_lowercase() == old_nick_lower))
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for buf_id in &affected {
+                state.update_nick(buf_id, &old_nick, new_nick);
+            }
+            rename_query_buffers(state, conn_id, new_nick, &affected);
+            return;
+        }
+    }
+
+    // Update in all buffers on this connection — channels (have user in nick list)
+    // AND query buffers (named after the nick, no users list).
+    let old_nick_lower = old_nick.to_lowercase();
+    let affected: Vec<String> = state
+        .buffers
+        .iter()
+        .filter(|(_, buf)| {
+            buf.connection_id == conn_id
+                && (buf.users.contains_key(&old_nick_lower)
+                    || (buf.buffer_type == BufferType::Query
+                        && buf.name.to_lowercase() == old_nick_lower))
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+
+    // First non-suppressed channel gets the full log row; others get reference rows.
+    let primary_msg_id = uuid::Uuid::new_v4().to_string();
+    let text = format!("{old_nick} is now known as {new_nick}");
+    let mut primary_assigned = false;
+    let ts = message_timestamp(tags.as_ref());
+    let now = Instant::now();
+
+    for buf_id in &affected {
+        state.update_nick(buf_id, &old_nick, new_nick);
+        state
+            .pending_web_events
+            .push(crate::web::protocol::WebEvent::NickEvent {
+                buffer_id: buf_id.clone(),
+                kind: crate::web::protocol::NickEventKind::NickChange,
+                nick: old_nick.clone(),
+                new_nick: Some(new_nick.to_string()),
+                prefix: None,
+                modes: None,
+                away: None,
+                message: None,
+            });
+
+        // --- Nick flood check ---
+        if state.flood_protection
+            && old_nick != our_nick
+            && state.flood_state.should_suppress_nick_flood(buf_id, now)
+        {
+            // Suppress the message display but nick was already updated above
+            continue;
+        }
+
+        let is_primary = !primary_assigned;
+        if is_primary {
+            primary_assigned = true;
+        }
+
+        let id = state.next_message_id();
+        state.add_message(
+            buf_id,
+            Message {
+                id,
+                timestamp: ts,
+                message_type: MessageType::Event,
+                nick: None,
+                nick_mode: None,
+                text: text.clone(),
+                highlight: false,
+                event_key: Some("nick_change".to_string()),
+                event_params: Some(vec![old_nick.clone(), new_nick.to_string()]),
+                log_msg_id: if is_primary {
+                    Some(primary_msg_id.clone())
+                } else {
+                    None
+                },
+                log_ref_id: if is_primary {
+                    None
+                } else {
+                    Some(primary_msg_id.clone())
+                },
+                tags: tags.clone(),
+            },
+        );
+    }
+
+    rename_query_buffers(state, conn_id, new_nick, &affected);
+}
+
+#[expect(clippy::too_many_arguments, reason = "IRC KICK has many parameters")]
+fn handle_kick(
+    state: &mut AppState,
+    conn_id: &str,
+    our_nick: &str,
+    prefix: Option<&Prefix>,
+    channel: &str,
+    kicked_user: &str,
+    reason: Option<&str>,
+    tags: Option<HashMap<String, String>>,
+) {
+    let (kicker, kicker_ident, kicker_host) = extract_nick_userhost(prefix);
+    let buffer_id = make_buffer_id(conn_id, channel);
+    let reason_str = reason.unwrap_or("");
+
+    // --- Ignore check (never ignore kicks against us) ---
+    if kicked_user != our_nick
+        && should_ignore(
+            &state.ignores,
+            &kicker,
+            Some(&kicker_ident),
+            Some(&kicker_host),
+            &IgnoreLevel::Kicks,
+            Some(channel),
+        )
+    {
+        // Still remove kicked user from nick list
+        state.remove_nick(&buffer_id, kicked_user);
+        return;
+    }
+
+    let ts = message_timestamp(tags.as_ref());
+    if kicked_user == our_nick {
+        let text = format!("You were kicked from {channel} by {kicker} ({reason_str})");
+        // Use the connection label for the server buffer ID (not the connection id).
+        let server_buffer_id = state.connections.get(conn_id).map_or_else(
+            || make_buffer_id(conn_id, conn_id),
+            |c| make_buffer_id(conn_id, &c.label),
+        );
+        let kick_params = Some(vec![
+            our_nick.to_string(),
+            kicker,
+            channel.to_string(),
+            reason_str.to_string(),
+        ]);
+
+        // Helper: build a "kicked" notification message, taking text/params/tags
+        // by reference (clone) or by value (move) on last call.
+        let make_kick_msg = |state: &mut AppState,
+                             t: String,
+                             p: Option<Vec<String>>,
+                             tg: Option<HashMap<String, String>>|
+         -> Message {
+            let id = state.next_message_id();
+            Message {
+                id,
+                timestamp: ts,
+                message_type: MessageType::Event,
+                nick: None,
+                nick_mode: None,
+                text: t,
+                highlight: true,
+                event_key: Some("kicked".to_string()),
+                event_params: p,
+                log_msg_id: None,
+                log_ref_id: None,
+                tags: tg,
+            }
+        };
+
+        // Add to server buffer (always visible, never removed).
+        let msg = make_kick_msg(state, text.clone(), kick_params.clone(), tags.clone());
+        state.add_message(&server_buffer_id, msg);
+
+        // Also add to the channel buffer before removal so the web client
+        // sees it in the channel history (it may still be displayed briefly).
+        let msg = make_kick_msg(state, text.clone(), kick_params.clone(), tags.clone());
+        state.add_message(&buffer_id, msg);
+
+        // Remove the channel buffer (falls back to previous or first buffer).
+        state.remove_buffer(&buffer_id);
+
+        // Add a reminder to the landing buffer so the user sees it immediately.
+        let landing_id = state
+            .active_buffer_id
+            .clone()
+            .unwrap_or_else(|| server_buffer_id.clone());
+        if landing_id != server_buffer_id {
+            let msg = make_kick_msg(state, text, kick_params, tags);
+            state.add_message(&landing_id, msg);
+        }
+
+        // Clean up any pending silent WHO for this channel.
+        if let Some(conn) = state.connections.get_mut(conn_id) {
+            remove_case_insensitive(&mut conn.silent_who_channels, channel);
+            remove_case_insensitive(&mut conn.silent_banlist_channels, channel);
+        }
+    } else {
+        state.remove_nick(&buffer_id, kicked_user);
+        let id = state.next_message_id();
+        state.add_message(
+            &buffer_id,
+            Message {
+                id,
+                timestamp: ts,
+                message_type: MessageType::Event,
+                nick: None,
+                nick_mode: None,
+                text: format!("{kicked_user} was kicked by {kicker} ({reason_str})"),
+                highlight: false,
+                event_key: Some("kick".to_string()),
+                event_params: Some(vec![
+                    kicked_user.to_string(),
+                    kicker,
+                    channel.to_string(),
+                    reason_str.to_string(),
+                ]),
+                log_msg_id: None,
+                log_ref_id: None,
+                tags,
+            },
+        );
+    }
+}
+
+fn handle_topic(
+    state: &mut AppState,
+    conn_id: &str,
+    prefix: Option<&Prefix>,
+    channel: &str,
+    topic: Option<&str>,
+    tags: Option<HashMap<String, String>>,
+) {
+    let nick = extract_nick(prefix);
+    let buffer_id = make_buffer_id(conn_id, channel);
+
+    if let Some(topic_text) = topic {
+        state.set_topic(&buffer_id, topic_text.to_string(), nick.clone());
+        state
+            .pending_web_events
+            .push(crate::web::protocol::WebEvent::TopicChanged {
+                buffer_id: buffer_id.clone(),
+                topic: Some(topic_text.to_string()),
+                set_by: nick.clone(),
+            });
+        let setter = nick.unwrap_or_default();
+        let id = state.next_message_id();
+        state.add_message(
+            &buffer_id,
+            Message {
+                id,
+                timestamp: message_timestamp(tags.as_ref()),
+                message_type: MessageType::Event,
+                nick: None,
+                nick_mode: None,
+                text: format!("{setter} changed the topic to: {topic_text}"),
+                highlight: false,
+                event_key: Some("topic_changed".to_string()),
+                event_params: Some(vec![setter, topic_text.to_string()]),
+                log_msg_id: None,
+                log_ref_id: None,
+                tags,
+            },
+        );
+    }
+}
+
+fn handle_mode(
+    state: &mut AppState,
+    conn_id: &str,
+    prefix: Option<&Prefix>,
+    target: &str,
+    raw_msg: &IrcMessage,
+    tags: Option<HashMap<String, String>>,
+) {
+    let nick = extract_nick(prefix).unwrap_or_else(|| "server".to_string());
+
+    // Build mode display string and apply changes based on command type
+    let mode_display = match &raw_msg.command {
+        Command::ChannelMODE(_, modes) => {
+            let buffer_id = make_buffer_id(conn_id, target);
+            // Apply nick prefix changes
+            for mode in modes {
+                apply_channel_mode(state, &buffer_id, mode, &nick);
+            }
+            build_channel_mode_string(modes)
+        }
+        Command::UserMODE(_, modes) => {
+            // Update user modes on connection
+            if let Some(conn) = state.connections.get_mut(conn_id) {
+                for mode in modes {
+                    let (adding, m) = match mode {
+                        irc::proto::Mode::Plus(m, _) | irc::proto::Mode::NoPrefix(m) => (true, m),
+                        irc::proto::Mode::Minus(m, _) => (false, m),
+                    };
+                    let c = user_mode_letter(m);
+                    if adding {
+                        if !conn.user_modes.contains(c) {
+                            conn.user_modes.push(c);
+                        }
+                    } else {
+                        conn.user_modes = conn.user_modes.replace(c, "");
+                    }
+                }
+            }
+            build_user_mode_string(modes)
+        }
+        _ => String::new(),
+    };
+
+    let ts = message_timestamp(tags.as_ref());
+    if is_channel(target) {
+        let buffer_id = make_buffer_id(conn_id, target);
+        let id = state.next_message_id();
+        state.add_message(
+            &buffer_id,
+            Message {
+                id,
+                timestamp: ts,
+                message_type: MessageType::Event,
+                nick: None,
+                nick_mode: None,
+                text: format!("{nick} sets mode {mode_display} on {target}"),
+                highlight: false,
+                event_key: Some("mode".to_string()),
+                event_params: Some(vec![nick, mode_display, target.to_string()]),
+                log_msg_id: None,
+                log_ref_id: None,
+                tags,
+            },
+        );
+    } else {
+        let label = state
+            .connections
+            .get(conn_id)
+            .map_or("Status", |c| c.label.as_str());
+        let server_buf = make_buffer_id(conn_id, label);
+        let id = state.next_message_id();
+        state.add_message(
+            &server_buf,
+            Message {
+                id,
+                timestamp: ts,
+                message_type: MessageType::Event,
+                nick: None,
+                nick_mode: None,
+                text: format!("{nick} sets mode {mode_display} on {target}"),
+                highlight: false,
+                event_key: Some("mode".to_string()),
+                event_params: Some(vec![nick, mode_display, target.to_string()]),
+                log_msg_id: None,
+                log_ref_id: None,
+                tags,
+            },
+        );
+    }
+}
+
+/// Apply a single channel mode change to nick entries and channel mode tracking.
+fn apply_channel_mode(
+    state: &mut AppState,
+    buffer_id: &str,
+    mode: &irc::proto::Mode<irc::proto::ChannelMode>,
+    set_by: &str,
+) {
+    use irc::proto::ChannelMode;
+
+    let (adding, mode_enum, param) = match mode {
+        irc::proto::Mode::Plus(m, p) => (true, m, p.as_deref()),
+        irc::proto::Mode::Minus(m, p) => (false, m, p.as_deref()),
+        irc::proto::Mode::NoPrefix(_) => return,
+    };
+
+    // Nick prefix modes — update user entries
+    let nick_mode_char = match mode_enum {
+        ChannelMode::Founder => Some('q'),
+        ChannelMode::Admin => Some('a'),
+        ChannelMode::Oper => Some('o'),
+        ChannelMode::Halfop => Some('h'),
+        ChannelMode::Voice => Some('v'),
+        _ => None,
+    };
+
+    if let Some(mc) = nick_mode_char
+        && let Some(target_nick) = param
+        && let Some(buf) = state.buffers.get_mut(buffer_id)
+        && let Some(entry) = buf.users.get_mut(&target_nick.to_lowercase())
+    {
+        if adding && !entry.modes.contains(mc) {
+            entry.modes.push(mc);
+        } else if !adding {
+            entry.modes = entry.modes.replace(mc, "");
+        }
+        entry.prefix = modes_to_prefix(&entry.modes, "~&@%+");
+        let new_prefix = entry.prefix.clone();
+        let new_modes = entry.modes.clone();
+        state
+            .pending_web_events
+            .push(crate::web::protocol::WebEvent::NickEvent {
+                buffer_id: buffer_id.to_string(),
+                kind: crate::web::protocol::NickEventKind::ModeChange,
+                nick: target_nick.to_string(),
+                new_nick: None,
+                prefix: Some(new_prefix),
+                modes: Some(new_modes),
+                away: None,
+                message: None,
+            });
+        return;
+    }
+
+    if matches!(mode_enum, ChannelMode::Ban) {
+        if let Some(mask) = param
+            && let Some(buf) = state.buffers.get_mut(buffer_id)
+        {
+            if adding {
+                upsert_list_mode_entry(
+                    buf,
+                    BAN_MODE_KEY,
+                    mask.to_string(),
+                    set_by.to_string(),
+                    Utc::now().timestamp(),
+                );
+            } else {
+                remove_list_mode_entry(buf, BAN_MODE_KEY, mask);
+            }
+        }
+        return;
+    }
+
+    // Channel modes (not nick prefix, not list modes) — update buf.modes
+    // Skip list modes (e, I, R) and nick prefix modes (already handled above)
+    let ch = channel_mode_letter(mode_enum);
+    let is_list_mode = matches!(
+        mode_enum,
+        ChannelMode::Exception | ChannelMode::InviteException | ChannelMode::Reop
+    );
+    if is_list_mode || nick_mode_char.is_some() {
+        return;
+    }
+
+    if let Some(buf) = state.buffers.get_mut(buffer_id) {
+        let modes = buf.modes.get_or_insert_with(String::new);
+        if adding {
+            if !modes.contains(ch) {
+                modes.push(ch);
+            }
+            // Store params for modes that carry values (k=key, l=limit)
+            if matches!(ch, 'k' | 'l')
+                && let Some(val) = param
+            {
+                buf.mode_params
+                    .get_or_insert_with(HashMap::new)
+                    .insert(ch.to_string(), val.to_string());
+            }
+        } else {
+            *modes = modes.replace(ch, "");
+            if let Some(ref mut mp) = buf.mode_params {
+                mp.remove(&ch.to_string());
+            }
+        }
+        // Strip leading '+' if present from RPL_CHANNELMODEIS
+        if modes.starts_with('+') {
+            *modes = modes[1..].to_string();
+        }
+    }
+}
+
+fn upsert_list_mode_entry(
+    buf: &mut Buffer,
+    mode_key: &str,
+    mask: String,
+    set_by: String,
+    set_at: i64,
+) -> usize {
+    let entries = buf.list_modes.entry(mode_key.to_string()).or_default();
+    if let Some(pos) = entries
+        .iter()
+        .position(|entry| entry.mask.eq_ignore_ascii_case(&mask))
+    {
+        entries[pos].set_by = set_by;
+        entries[pos].set_at = set_at;
+        return pos + 1;
+    }
+
+    entries.push(ListEntry {
+        mask,
+        set_by,
+        set_at,
+    });
+    if entries.len() > MAX_LIST_MODE_ENTRIES {
+        entries.drain(..entries.len() - MAX_LIST_MODE_ENTRIES);
+    }
+    entries.len()
+}
+
+fn remove_list_mode_entry(buf: &mut Buffer, mode_key: &str, mask: &str) -> bool {
+    let Some(entries) = buf.list_modes.get_mut(mode_key) else {
+        return false;
+    };
+
+    let original_len = entries.len();
+    entries.retain(|entry| !entry.mask.eq_ignore_ascii_case(mask));
+    let new_len = entries.len();
+    if new_len == 0 {
+        buf.list_modes.remove(mode_key);
+    }
+    new_len != original_len
+}
+
+/// Build a displayable mode string from channel modes.
+fn build_channel_mode_string(modes: &[irc::proto::Mode<irc::proto::ChannelMode>]) -> String {
+    let mut result = String::new();
+    let mut params = Vec::new();
+    let mut last_sign = ' ';
+
+    for mode in modes {
+        let (sign, m, param) = match mode {
+            irc::proto::Mode::Plus(m, p) => ('+', m, p.as_deref()),
+            irc::proto::Mode::Minus(m, p) => ('-', m, p.as_deref()),
+            irc::proto::Mode::NoPrefix(m) => (' ', m, None),
+        };
+        if sign != last_sign && sign != ' ' {
+            result.push(sign);
+            last_sign = sign;
+        }
+        result.push(channel_mode_letter(m));
+        if let Some(p) = param {
+            params.push(p);
+        }
+    }
+
+    if !params.is_empty() {
+        result.push(' ');
+        result.push_str(&params.join(" "));
+    }
+    result
+}
+
+/// Build a displayable mode string from user modes.
+fn build_user_mode_string(modes: &[irc::proto::Mode<irc::proto::UserMode>]) -> String {
+    let mut result = String::new();
+    let mut last_sign = ' ';
+
+    for mode in modes {
+        let (sign, m) = match mode {
+            irc::proto::Mode::Plus(m, _) => ('+', m),
+            irc::proto::Mode::Minus(m, _) => ('-', m),
+            irc::proto::Mode::NoPrefix(m) => (' ', m),
+        };
+        if sign != last_sign && sign != ' ' {
+            result.push(sign);
+            last_sign = sign;
+        }
+        result.push(user_mode_letter(m));
+    }
+    result
+}
+
+const fn channel_mode_letter(m: &irc::proto::ChannelMode) -> char {
+    use irc::proto::ChannelMode;
+    match m {
+        ChannelMode::Ban => 'b',
+        ChannelMode::Exception => 'e',
+        ChannelMode::Limit => 'l',
+        ChannelMode::InviteOnly => 'i',
+        ChannelMode::InviteException => 'I',
+        ChannelMode::Key => 'k',
+        ChannelMode::Moderated => 'm',
+        ChannelMode::RegisteredOnly => 'r',
+        ChannelMode::Reop => 'R',
+        ChannelMode::Secret => 's',
+        ChannelMode::ProtectedTopic => 't',
+        ChannelMode::NoExternalMessages => 'n',
+        ChannelMode::Founder => 'q',
+        ChannelMode::Admin => 'a',
+        ChannelMode::Oper => 'o',
+        ChannelMode::Halfop => 'h',
+        ChannelMode::Voice => 'v',
+        ChannelMode::Unknown(c) => *c,
+    }
+}
+
+const fn user_mode_letter(m: &irc::proto::UserMode) -> char {
+    use irc::proto::UserMode;
+    match m {
+        UserMode::Away => 'a',
+        UserMode::Invisible => 'i',
+        UserMode::Wallops => 'w',
+        UserMode::Restricted => 'r',
+        UserMode::Oper => 'o',
+        UserMode::LocalOper => 'O',
+        UserMode::ServerNotices => 's',
+        UserMode::MaskedHost => 'x',
+        UserMode::Unknown(c) => *c,
+    }
+}
+
+fn handle_invite(
+    state: &mut AppState,
+    conn_id: &str,
+    our_nick: &str,
+    prefix: Option<&Prefix>,
+    nick: &str,
+    channel: &str,
+    tags: Option<HashMap<String, String>>,
+) {
+    let inviter = extract_nick(prefix).unwrap_or_default();
+
+    if nick.eq_ignore_ascii_case(our_nick) {
+        // We are the invited user — show in active buffer or server buffer (highlight)
+        let label = state
+            .connections
+            .get(conn_id)
+            .map_or("Status", |c| c.label.as_str());
+        let buffer_id = state
+            .active_buffer_id
+            .clone()
+            .unwrap_or_else(|| make_buffer_id(conn_id, label));
+
+        let id = state.next_message_id();
+        state.add_message(
+            &buffer_id,
+            Message {
+                id,
+                timestamp: message_timestamp(tags.as_ref()),
+                message_type: MessageType::Event,
+                nick: None,
+                nick_mode: None,
+                text: format!("{inviter} invites you to {channel}"),
+                highlight: true,
+                event_key: None,
+                event_params: None,
+                log_msg_id: None,
+                log_ref_id: None,
+                tags,
+            },
+        );
+    } else {
+        // invite-notify: someone else was invited — show in the channel buffer
+        let buffer_id = make_buffer_id(conn_id, channel);
+        if state.buffers.contains_key(&buffer_id) {
+            let id = state.next_message_id();
+            state.add_message(
+                &buffer_id,
+                Message {
+                    id,
+                    timestamp: message_timestamp(tags.as_ref()),
+                    message_type: MessageType::Event,
+                    nick: None,
+                    nick_mode: None,
+                    text: format!("{inviter} invited {nick} to {channel}"),
+                    highlight: false,
+                    event_key: None,
+                    event_params: None,
+                    log_msg_id: None,
+                    log_ref_id: None,
+                    tags,
+                },
+            );
+        }
+    }
+}
+
+fn handle_error(state: &mut AppState, conn_id: &str, message: &str) {
+    tracing::warn!("ERROR from {conn_id}: {message}");
+
+    // Mark the connection as errored
+    if let Some(conn) = state.connections.get_mut(conn_id) {
+        conn.status = ConnectionStatus::Error;
+        conn.error = Some(message.to_string());
+    }
+
+    let buf = server_buffer(state, conn_id);
+    emit(state, &buf, &format!("%Zff4444ERROR: {message}%N"));
+}
+
+fn handle_wallops(state: &mut AppState, conn_id: &str, prefix: Option<&Prefix>, text: &str) {
+    let from = extract_nick(prefix).unwrap_or_else(|| "server".to_string());
+    let label = state
+        .connections
+        .get(conn_id)
+        .map_or("Status", |c| c.label.as_str());
+    let buffer_id = make_buffer_id(conn_id, label);
+    emit(
+        state,
+        &buffer_id,
+        &format!("%Ze0af68[Wallops/{from}]%N {text}"),
+    );
+}
+
+#[expect(clippy::too_many_lines, reason = "dispatcher pattern")]
+fn handle_response(state: &mut AppState, conn_id: &str, response: Response, args: &[String]) {
+    match response {
+        // RPL_MYINFO: informational only, no state changes needed.
+
+        // RPL_ISUPPORT: args = [our_nick, TOKEN=VALUE, TOKEN=VALUE, ..., "are supported by this server"]
+        Response::RPL_ISUPPORT => {
+            if args.len() >= 2 {
+                // Parse KEY=VALUE tokens (skip first arg = our nick, skip last = trailing text)
+                let tokens = &args[1..args.len().saturating_sub(1)];
+                let token_strs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+                if let Some(conn) = state.connections.get_mut(conn_id) {
+                    conn.isupport_parsed.parse_tokens(&token_strs);
+                }
+                // Update label from NETWORK for ad-hoc connections
+                if let Some(network) = state
+                    .connections
+                    .get(conn_id)
+                    .and_then(|c| c.isupport_parsed.network().map(str::to_owned))
+                {
+                    update_label_from_network(state, conn_id, &network);
+                }
+            }
+        }
+
+        // RPL_NAMREPLY: args = [our_nick, "=" | "*" | "@", channel, "nick1 nick2 ..."]
+        //
+        // Supports:
+        // - multi-prefix: server sends ALL mode prefixes per nick (e.g. `@+nick`)
+        // - userhost-in-names: server sends `nick!user@host` format
+        Response::RPL_NAMREPLY => {
+            if args.len() >= 4 {
+                let channel = &args[2];
+                let buffer_id = make_buffer_id(conn_id, channel);
+                let nicks_str = &args[3];
+
+                // Get prefix map and userhost-in-names state from connection
+                let (prefix_map, has_userhost) = state
+                    .connections
+                    .get(conn_id)
+                    .map_or_else(
+                        || (vec![('o', '@'), ('v', '+')], false),
+                        |c| (c.isupport_parsed.prefix_map(), c.enabled_caps.contains("userhost-in-names")),
+                    );
+
+                for nick_with_prefix in nicks_str.split_whitespace() {
+                    let entry = parse_names_entry(nick_with_prefix, &prefix_map, has_userhost);
+                    state.add_nick(&buffer_id, entry);
+                }
+            }
+        }
+        // RPL_TOPIC: args = [our_nick, channel, topic]
+        Response::RPL_TOPIC => {
+            if args.len() >= 3 {
+                let channel = &args[1];
+                let topic = &args[2];
+                let buffer_id = make_buffer_id(conn_id, channel);
+                state.set_topic(&buffer_id, topic.clone(), None);
+            }
+        }
+        // RPL_TOPICWHOTIME: args = [our_nick, channel, set_by, timestamp]
+        Response::RPL_TOPICWHOTIME => {
+            if args.len() >= 3 {
+                let channel = &args[1];
+                let set_by = &args[2];
+                let buffer_id = make_buffer_id(conn_id, channel);
+                if let Some(buf) = state.buffers.get_mut(&buffer_id) {
+                    buf.topic_set_by = Some(set_by.clone());
+                }
+            }
+        }
+        // RPL_CHANNELMODEIS: args = [our_nick, channel, modes, param1, param2, ...]
+        // e.g. [nick, #chan, +ntlk, 50, secret]
+        Response::RPL_CHANNELMODEIS => {
+            if args.len() >= 3 {
+                let channel = &args[1];
+                let mode_str = args[2].strip_prefix('+').unwrap_or(&args[2]);
+                let buffer_id = make_buffer_id(conn_id, channel);
+                if let Some(buf) = state.buffers.get_mut(&buffer_id) {
+                    buf.modes = Some(mode_str.to_string());
+                    // Parse mode params: modes with params (k, l, etc.) consume
+                    // positional args starting from args[3].
+                    let mut param_idx = 3;
+                    let mut params = HashMap::new();
+                    for ch in mode_str.chars() {
+                        // Type B (always has param): k
+                        // Type C (param when set): l
+                        if matches!(ch, 'k' | 'l')
+                            && let Some(val) = args.get(param_idx)
+                        {
+                            params.insert(ch.to_string(), val.clone());
+                            param_idx += 1;
+                        }
+                    }
+                    if params.is_empty() {
+                        buf.mode_params = None;
+                    } else {
+                        buf.mode_params = Some(params);
+                    }
+                }
+            }
+        }
+
+        // === WHOIS responses — show in active buffer ===
+
+        // RPL_WHOISUSER: args = [our_nick, nick, user, host, *, realname]
+        Response::RPL_WHOISUSER => {
+            if args.len() >= 6 {
+                let target_buf = whois_buffer(state, conn_id);
+                emit_event(
+                    state,
+                    &target_buf,
+                    "whois_header",
+                    format!(
+                        "%Z7aa2f7───── WHOIS {} ──────────────────────────%N",
+                        args[1]
+                    ),
+                    vec![args[1].clone()],
+                );
+                emit_event(
+                    state,
+                    &target_buf,
+                    "whois",
+                    format!(
+                        "%Zc0caf5{}%Z565f89 ({}@{})%N %Za9b1d6{}%N",
+                        args[1], args[2], args[3], args[5]
+                    ),
+                    vec![
+                        args[1].clone(),
+                        args[2].clone(),
+                        args[3].clone(),
+                        args[5].clone(),
+                    ],
+                );
+            }
+        }
+        // RPL_WHOISSERVER: args = [our_nick, nick, server, server_info]
+        Response::RPL_WHOISSERVER => {
+            if args.len() >= 4 {
+                let target_buf = whois_buffer(state, conn_id);
+                let info = if args[3].is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", args[3])
+                };
+                emit_event(
+                    state,
+                    &target_buf,
+                    "whois_server",
+                    format!("%Z565f89  server: %Za9b1d6{}{info}%N", args[2]),
+                    vec![args[1].clone(), args[2].clone(), args[3].clone(), info],
+                );
+            }
+        }
+        // RPL_WHOISOPERATOR: args = [our_nick, nick, "is an IRC operator"]
+        Response::RPL_WHOISOPERATOR => {
+            if args.len() >= 3 {
+                let target_buf = whois_buffer(state, conn_id);
+                emit_event(
+                    state,
+                    &target_buf,
+                    "whois_oper",
+                    format!("  %Zbb9af7{}%N", args[2]),
+                    vec![args[1].clone(), args[2].clone()],
+                );
+            }
+        }
+        // RPL_WHOISIDLE: args = [our_nick, nick, idle_secs, signon_time, ...]
+        Response::RPL_WHOISIDLE => {
+            if args.len() >= 3 {
+                let target_buf = whois_buffer(state, conn_id);
+                let idle = args[2].parse::<u64>().unwrap_or(0);
+                let idle_display = format_duration(idle);
+                if args.len() >= 4
+                    && let Ok(ts) = args[3].parse::<i64>()
+                {
+                    let dt = chrono::DateTime::from_timestamp(ts, 0)
+                        .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_default();
+                    emit_event(
+                        state,
+                        &target_buf,
+                        "whois_idle_signon",
+                        format!(
+                            "%Z565f89  idle: %Za9b1d6{idle_display}%Z565f89, signon: %Za9b1d6{dt}%N"
+                        ),
+                        vec![args[1].clone(), idle_display, dt],
+                    );
+                } else {
+                    emit_event(
+                        state,
+                        &target_buf,
+                        "whois_idle",
+                        format!("%Z565f89  idle: %Za9b1d6{idle_display}%N"),
+                        vec![args[1].clone(), idle_display],
+                    );
+                }
+            }
+        }
+        // RPL_WHOISCHANNELS: args = [our_nick, nick, channels]
+        Response::RPL_WHOISCHANNELS => {
+            if args.len() >= 3 {
+                let target_buf = whois_buffer(state, conn_id);
+                emit_event(
+                    state,
+                    &target_buf,
+                    "whois_channels",
+                    format!("%Z565f89  channels: %Za9b1d6{}%N", args[2]),
+                    vec![args[1].clone(), args[2].clone()],
+                );
+            }
+        }
+        // RPL_WHOISCERTFP: args = [our_nick, nick, fingerprint]
+        Response::RPL_WHOISCERTFP => {
+            if args.len() >= 3 {
+                let target_buf = whois_buffer(state, conn_id);
+                emit_event(
+                    state,
+                    &target_buf,
+                    "whois_certfp",
+                    format!("%Z565f89  certfp: %Za9b1d6{}%N", args[2]),
+                    vec![args[1].clone(), args[2].clone()],
+                );
+            }
+        }
+        // RPL_WHOISKEYVALUE: args = [our_nick, target, key, visibility, value]
+        Response::RPL_WHOISKEYVALUE => {
+            if args.len() >= 5 {
+                let target_buf = whois_buffer(state, conn_id);
+                emit_event(
+                    state,
+                    &target_buf,
+                    "whois_keyvalue",
+                    format!("%Z565f89  {}: %Za9b1d6{}%N", args[2], args[4]),
+                    vec![
+                        args[1].clone(),
+                        args[2].clone(),
+                        args[3].clone(),
+                        args[4].clone(),
+                    ],
+                );
+            }
+        }
+        // RPL_ENDOFWHOIS: args = [our_nick, nick, "End of WHOIS list"]
+        Response::RPL_ENDOFWHOIS => {
+            let target_buf = whois_buffer(state, conn_id);
+            let nick = args.get(1).cloned().unwrap_or_default();
+            let text = args.get(2).cloned().unwrap_or_default();
+            emit_event(
+                state,
+                &target_buf,
+                "end_of_whois",
+                "%Z7aa2f7─────────────────────────────────────────────%N",
+                vec![nick, text],
+            );
+        }
+
+        // RPL_AWAY: args = [our_nick, nick, away_message]
+        Response::RPL_AWAY => {
+            if args.len() >= 3 {
+                let target_buf = whois_buffer(state, conn_id);
+                emit_event(
+                    state,
+                    &target_buf,
+                    "whois_away",
+                    format!("%Z565f89  away: %Ze0af68{}%N", args[2]),
+                    vec![args[1].clone(), args[2].clone()],
+                );
+            }
+        }
+
+        // === Ban list responses ===
+
+        // RPL_BANLIST: args = [our_nick, channel, banmask, set_by, timestamp]
+        Response::RPL_BANLIST => {
+            if args.len() >= 3 {
+                let channel = &args[1];
+                let mask = &args[2];
+                let set_by = args.get(3).cloned().unwrap_or_default();
+                let set_at = args.get(4).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                let silent = state
+                    .connections
+                    .get(conn_id)
+                    .is_some_and(|c| {
+                        contains_case_insensitive(&c.silent_banlist_channels, channel)
+                    });
+
+                let buf_id = crate::state::buffer::make_buffer_id(conn_id, channel);
+                let index = state.buffers.get_mut(&buf_id).map_or(0, |buf| {
+                    upsert_list_mode_entry(
+                        buf,
+                        BAN_MODE_KEY,
+                        mask.clone(),
+                        set_by.clone(),
+                        set_at,
+                    )
+                });
+
+                if silent {
+                    return;
+                }
+
+                let target_buf = active_or_server_buffer(state, conn_id);
+                let set_info = if set_by.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (set by {} {})", set_by, format_timestamp(args.get(4).map_or("0", |s| s.as_str())))
+                };
+                let extban_prefix = state.connections.get(conn_id)
+                    .and_then(|c| c.isupport_parsed.extban())
+                    .map(|(prefix, _)| prefix);
+                let mask_display = crate::irc::extban::format_ban_mask(mask, extban_prefix);
+                emit(state, &target_buf, &format!(
+                    "%Z565f89  {index}. %Za9b1d6{mask_display}{set_info}%N"
+                ));
+            }
+        }
+        // RPL_ENDOFBANLIST
+        Response::RPL_ENDOFBANLIST => {
+            let channel = args.get(1).map_or("", String::as_str);
+            let was_silent = state
+                .connections
+                .get_mut(conn_id)
+                .is_some_and(|conn| {
+                    remove_case_insensitive(&mut conn.silent_banlist_channels, channel)
+                });
+            if was_silent {
+                return;
+            }
+            let target_buf = active_or_server_buffer(state, conn_id);
+            emit(state, &target_buf, "%Z565f89  End of ban list%N");
+        }
+
+        // === Exception list responses (+e) ===
+        Response::RPL_EXCEPTLIST => {
+            if args.len() >= 3 {
+                let target_buf = active_or_server_buffer(state, conn_id);
+                let set_info = if args.len() >= 5 {
+                    format!(" (set by {} {})", args[3], format_timestamp(&args[4]))
+                } else {
+                    String::new()
+                };
+                let extban_prefix = state.connections.get(conn_id)
+                    .and_then(|c| c.isupport_parsed.extban())
+                    .map(|(prefix, _)| prefix);
+                let mask_display = crate::irc::extban::format_ban_mask(&args[2], extban_prefix);
+                emit(state, &target_buf, &format!(
+                    "%Z565f89  except: %Za9b1d6{mask_display}{set_info}%N"
+                ));
+            }
+        }
+        Response::RPL_ENDOFEXCEPTLIST => {
+            let target_buf = active_or_server_buffer(state, conn_id);
+            emit(state, &target_buf, "%Z565f89  End of exception list%N");
+        }
+
+        // === Invite exception list responses (+I) ===
+        Response::RPL_INVITELIST => {
+            if args.len() >= 3 {
+                let target_buf = active_or_server_buffer(state, conn_id);
+                let set_info = if args.len() >= 5 {
+                    format!(" (set by {} {})", args[3], format_timestamp(&args[4]))
+                } else {
+                    String::new()
+                };
+                let extban_prefix = state.connections.get(conn_id)
+                    .and_then(|c| c.isupport_parsed.extban())
+                    .map(|(prefix, _)| prefix);
+                let mask_display = crate::irc::extban::format_ban_mask(&args[2], extban_prefix);
+                emit(state, &target_buf, &format!(
+                    "%Z565f89  invex: %Za9b1d6{mask_display}{set_info}%N"
+                ));
+            }
+        }
+        Response::RPL_ENDOFINVITELIST => {
+            let target_buf = active_or_server_buffer(state, conn_id);
+            emit(state, &target_buf, "%Z565f89  End of invite exception list%N");
+        }
+
+        // === MOTD responses ===
+
+        Response::RPL_MOTDSTART => {
+            let target_buf = server_buffer(state, conn_id);
+            emit(state, &target_buf, "%Z56b6c2── MOTD ──────────────────────────────────────%N");
+        }
+        Response::RPL_MOTD => {
+            if args.len() >= 2 {
+                let target_buf = server_buffer(state, conn_id);
+                let line = &args[args.len() - 1];
+                emit(state, &target_buf, &format!("%Z7aa2f7{line}%N"));
+            }
+        }
+        Response::RPL_ENDOFMOTD => {
+            let target_buf = server_buffer(state, conn_id);
+            emit(state, &target_buf, "%Z56b6c2── End of MOTD ─────────────────────────────%N");
+        }
+
+        // === Nick collision / erroneous nick ===
+
+        Response::ERR_NICKNAMEINUSE => {
+            // Display only — the irc crate handles retry via alt_nicks internally.
+            let attempted = if args.len() >= 2 { &args[1] } else { "unknown" };
+            let target_buf = server_buffer(state, conn_id);
+            emit(
+                state,
+                &target_buf,
+                &format!("%Ze0af68Nick {attempted} is already in use%N"),
+            );
+        }
+        Response::ERR_ERRONEOUSNICKNAME => {
+            let attempted = if args.len() >= 2 { &args[1] } else { "unknown" };
+            let reason = if args.len() >= 3 { &args[2] } else { "Erroneous nickname" };
+            let target_buf = server_buffer(state, conn_id);
+            emit(
+                state,
+                &target_buf,
+                &format!("%Zff6b6bErroneous nick {attempted}: {reason}%N"),
+            );
+        }
+
+        // === Channel join failures ===
+        // Destroy eagerly-created buffers when the server rejects a JOIN.
+        // args: [our_nick, channel, reason]
+
+        Response::ERR_CHANNELISFULL       // 471
+        | Response::ERR_INVITEONLYCHAN    // 473
+        | Response::ERR_BANNEDFROMCHAN    // 474
+        | Response::ERR_BADCHANNELKEY     // 475
+        | Response::ERR_TOOMANYCHANNELS   // 405
+        => {
+            let channel = if args.len() >= 2 { &args[1] } else { "?" };
+            let reason = if args.len() >= 3 { &args[2] } else { "Cannot join channel" };
+            let buffer_id = make_buffer_id(conn_id, channel);
+
+            // Show the error in the server buffer.
+            let target_buf = server_buffer(state, conn_id);
+            emit(
+                state,
+                &target_buf,
+                &format!("%Zff6b6bCannot join {channel}: {reason}%N"),
+            );
+
+            // Destroy the pre-created buffer if no one has joined it yet
+            // (no users means we never received our own JOIN confirmation).
+            let should_remove = state
+                .buffers
+                .get(&buffer_id)
+                .is_some_and(|buf| buf.users.is_empty());
+            if should_remove {
+                state.remove_buffer(&buffer_id);
+            }
+        }
+
+        // === Away responses ===
+
+        Response::RPL_NOWAWAY => {
+            let target_buf = active_or_server_buffer(state, conn_id);
+            emit(state, &target_buf, "%Z56b6c2You are now marked as away%N");
+        }
+        Response::RPL_UNAWAY => {
+            let target_buf = active_or_server_buffer(state, conn_id);
+            emit(state, &target_buf, "%Z56b6c2You are no longer marked as away%N");
+        }
+
+        // === LIST responses ===
+
+        Response::RPL_LIST => {
+            // params: [our_nick, channel, user_count, topic]
+            if args.len() >= 3 {
+                let channel = &args[1];
+                let user_count = &args[2];
+                let topic = if args.len() >= 4 { &args[3] } else { "" };
+                let target_buf = active_or_server_buffer(state, conn_id);
+                if topic.is_empty() {
+                    emit(state, &target_buf, &format!(
+                        "%Zc0caf5{channel}%Z565f89 [{user_count} users]%N"
+                    ));
+                } else {
+                    emit(state, &target_buf, &format!(
+                        "%Zc0caf5{channel}%Z565f89 [{user_count} users]%N: {topic}"
+                    ));
+                }
+            }
+        }
+        Response::RPL_LISTEND => {
+            let target_buf = active_or_server_buffer(state, conn_id);
+            emit(state, &target_buf, "%Z565f89End of channel list%N");
+        }
+
+        // === WHO responses ===
+
+        Response::RPL_WHOREPLY => {
+            // params: [our_nick, channel, user, host, server, nick, flags, hopcount_realname]
+            if args.len() >= 8 {
+                let channel = &args[1];
+                let silent = state
+                    .connections
+                    .get(conn_id)
+                    .is_some_and(|c| contains_case_insensitive(&c.silent_who_channels, channel));
+                if !silent {
+                    let user = &args[2];
+                    let host = &args[3];
+                    let nick = &args[5];
+                    let flags = &args[6];
+                    let realname = &args[7];
+                    let target_buf = active_or_server_buffer(state, conn_id);
+                    emit(state, &target_buf, &format!(
+                        "%Zc0caf5{nick}%Z565f89 ({user}@{host}) [{flags}] {channel}%Za9b1d6 {realname}%N"
+                    ));
+                }
+            }
+        }
+        Response::RPL_ENDOFWHO => {
+            // args: [our_nick, target, "End of WHO list"]
+            // Target may be a single channel or comma-separated (batched WHO).
+            let target = args.get(1).map_or("", String::as_str);
+            let was_silent = if let Some(conn) = state.connections.get_mut(conn_id) {
+                if target.contains(',') {
+                    // Batched WHO — remove each channel individually.
+                    let mut any_silent = false;
+                    for ch in target.split(',') {
+                        any_silent |= remove_case_insensitive(&mut conn.silent_who_channels, ch);
+                    }
+                    any_silent
+                } else {
+                    remove_case_insensitive(&mut conn.silent_who_channels, target)
+                }
+            } else {
+                false
+            };
+            if !was_silent {
+                let target_buf = active_or_server_buffer(state, conn_id);
+                emit(state, &target_buf, "%Z565f89End of WHO list%N");
+            }
+        }
+        Response::RPL_USERHOST => {
+            handle_userhost_reply(state, conn_id, args);
+        }
+
+        // === WHOWAS responses ===
+
+        Response::RPL_WHOWASUSER => {
+            // params: [our_nick, nick, user, host, *, realname]
+            if args.len() >= 6 {
+                let nick = &args[1];
+                let user = &args[2];
+                let host = &args[3];
+                let realname = &args[5];
+                let target_buf = active_or_server_buffer(state, conn_id);
+                emit(state, &target_buf, &format!(
+                    "%Zc0caf5{nick}%Z565f89 was ({user}@{host})%Za9b1d6 {realname}%N"
+                ));
+            }
+        }
+        Response::RPL_ENDOFWHOWAS => {
+            let target_buf = active_or_server_buffer(state, conn_id);
+            emit(state, &target_buf, "%Z565f89End of WHOWAS%N");
+        }
+
+        // Silently consume RPL_ENDOFNAMES — we already have the nick list
+        Response::RPL_ENDOFNAMES => {}
+
+        _ => {
+            if matches!(
+                response,
+                Response::ERR_CHANOPRIVSNEEDED
+                    | Response::ERR_NOSUCHCHANNEL
+                    | Response::ERR_NOTONCHANNEL
+            ) && let Some(channel) = args.get(1)
+                && state
+                    .connections
+                    .get_mut(conn_id)
+                    .is_some_and(|conn| {
+                        remove_case_insensitive(&mut conn.silent_banlist_channels, channel)
+                    })
+            {
+                return;
+            }
+            // Error numerics (4xx) go to the active window — they are responses
+            // to user commands (e.g. "No such nick/channel"). Informational
+            // numerics still go to the server buffer.
+            let buffer_id = if response.is_error() {
+                active_or_server_buffer(state, conn_id)
+            } else {
+                server_buffer(state, conn_id)
+            };
+            // Skip args[0] which is our nick
+            let text = if args.len() > 1 {
+                args[1..].join(" ")
+            } else {
+                args.join(" ")
+            };
+            let id = state.next_message_id();
+            state.add_message(
+                &buffer_id,
+                Message {
+                    id,
+                    timestamp: Utc::now(),
+                    message_type: MessageType::Event,
+                    nick: None,
+                    nick_mode: None,
+                    text,
+                    highlight: false,
+                    event_key: None,
+                    event_params: None, log_msg_id: None, log_ref_id: None,
+                    tags: None,
+                },
+            );
+        }
+    }
+}
+
+/// Update connection label and server buffer name from NETWORK token.
+/// Only applies to ad-hoc connections where the label still matches the address.
+fn update_label_from_network(state: &mut AppState, conn_id: &str, network_name: &str) {
+    let current_label = match state.connections.get(conn_id) {
+        Some(conn) => conn.label.clone(),
+        None => return,
+    };
+
+    // Only update if label looks like a raw address (contains a dot = ad-hoc)
+    // Configured servers already have a human-friendly label from config.
+    if !current_label.contains('.') {
+        return;
+    }
+
+    // Update connection label
+    if let Some(conn) = state.connections.get_mut(conn_id) {
+        conn.label = network_name.to_string();
+    }
+
+    // Rename the server buffer: change id and name
+    let old_buf_id = make_buffer_id(conn_id, &current_label);
+    let new_buf_id = make_buffer_id(conn_id, network_name);
+    if let Some(mut buf) = state.buffers.shift_remove(&old_buf_id) {
+        buf.id.clone_from(&new_buf_id);
+        buf.name = network_name.to_string();
+        state.buffers.insert(new_buf_id.clone(), buf);
+
+        // Update active buffer reference if it pointed to the old id
+        if state.active_buffer_id.as_deref() == Some(&old_buf_id) {
+            state.active_buffer_id = Some(new_buf_id);
+        }
+    }
+}
+
+/// Helper: emit a formatted event message to a buffer.
+pub fn emit(state: &mut AppState, buffer_id: &str, text: &str) {
+    let id = state.next_message_id();
+    state.add_message(
+        buffer_id,
+        Message {
+            id,
+            timestamp: Utc::now(),
+            message_type: MessageType::Event,
+            nick: None,
+            nick_mode: None,
+            text: text.to_string(),
+            highlight: false,
+            event_key: None,
+            event_params: None,
+            log_msg_id: None,
+            log_ref_id: None,
+            tags: None,
+        },
+    );
+}
+
+fn emit_event(
+    state: &mut AppState,
+    buffer_id: &str,
+    event_key: &str,
+    text: impl Into<String>,
+    event_params: Vec<String>,
+) {
+    let id = state.next_message_id();
+    state.add_message(
+        buffer_id,
+        Message {
+            id,
+            timestamp: Utc::now(),
+            message_type: MessageType::Event,
+            nick: None,
+            nick_mode: None,
+            text: text.into(),
+            highlight: false,
+            event_key: Some(event_key.to_string()),
+            event_params: Some(event_params),
+            log_msg_id: None,
+            log_ref_id: None,
+            tags: None,
+        },
+    );
+}
+
+/// Get the server's status buffer ID.
+fn server_buffer(state: &AppState, conn_id: &str) -> String {
+    let label = state
+        .connections
+        .get(conn_id)
+        .map_or("Status", |c| c.label.as_str());
+    make_buffer_id(conn_id, label)
+}
+
+/// Get the active buffer, or fall back to the server buffer.
+///
+/// Uses `as_deref()` to inspect the active buffer ID without cloning,
+/// then clones only when needed (the `Some` branch) or constructs a
+/// new ID (the `None` branch).
+fn active_or_server_buffer(state: &AppState, conn_id: &str) -> String {
+    state.active_buffer_id.as_deref().map_or_else(
+        || {
+            let label = state
+                .connections
+                .get(conn_id)
+                .map_or("Status", |c| c.label.as_str());
+            make_buffer_id(conn_id, label)
+        },
+        str::to_owned,
+    )
+}
+
+/// Get the buffer where WHOIS output should go.
+fn whois_buffer(state: &AppState, conn_id: &str) -> String {
+    active_or_server_buffer(state, conn_id)
+}
+
+fn handle_whois_account(state: &mut AppState, conn_id: &str, args: &[String]) {
+    if args.len() >= 3 {
+        let target_buf = whois_buffer(state, conn_id);
+        let text = args.get(3).cloned().unwrap_or_default();
+        emit_event(
+            state,
+            &target_buf,
+            "whois_account",
+            format!("%Z565f89  account: %Za9b1d6{}%N", args[2]),
+            vec![args[1].clone(), args[2].clone(), text],
+        );
+    }
+}
+
+fn handle_whois_secure(state: &mut AppState, conn_id: &str, args: &[String]) {
+    if args.len() >= 2 {
+        let target_buf = whois_buffer(state, conn_id);
+        let text = args
+            .get(2)
+            .cloned()
+            .unwrap_or_else(|| "is using a secure connection".to_string());
+        emit_event(
+            state,
+            &target_buf,
+            "whois_secure",
+            "%Z565f89  secure: %Z9ece6aTLS%N",
+            vec![args[1].clone(), "TLS".to_string(), text],
+        );
+    }
+}
+
+/// Format a duration in seconds to a human-readable string.
+fn format_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else if secs < 86400 {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!("{}d {}h", secs / 86400, (secs % 86400) / 3600)
+    }
+}
+
+/// Format a unix timestamp string.
+fn format_timestamp(ts_str: &str) -> String {
+    ts_str
+        .parse::<i64>()
+        .ok()
+        .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_default()
+}
+
+/// Parse a single entry from a NAMES reply, handling multi-prefix and
+/// userhost-in-names capabilities.
+///
+/// `prefix_map` is the server's `(mode_char, prefix_char)` list from ISUPPORT
+/// PREFIX (e.g. `[('o', '@'), ('v', '+')]`).
+///
+/// When `has_userhost` is true, the nick portion is expected in `nick!user@host`
+/// format.
+///
+/// # Examples
+///
+/// Standard:   `@nick`         → prefix="@", modes="o", nick="nick"
+/// Multi:      `@+nick`        → prefix="@+", modes="ov", nick="nick"
+/// Userhost:   `@+nick!u@host` → prefix="@+", modes="ov", nick="nick", ident="u", host="host"
+fn parse_names_entry(raw: &str, prefix_map: &[(char, char)], has_userhost: bool) -> NickEntry {
+    // Strip all leading prefix characters, using the server's PREFIX map
+    // to determine which characters are valid prefixes and their modes.
+    let mut prefix = String::new();
+    let mut modes = String::new();
+    let mut rest = raw;
+    while let Some(c) = rest.chars().next() {
+        if let Some(&(mode, _)) = prefix_map.iter().find(|&&(_, p)| p == c) {
+            prefix.push(c);
+            modes.push(mode);
+            rest = &rest[c.len_utf8()..];
+        } else {
+            break;
+        }
+    }
+
+    // Parse nick!user@host if userhost-in-names is enabled
+    let (nick, ident, host) = if has_userhost {
+        parse_userhost(rest)
+    } else {
+        (rest.to_string(), None, None)
+    };
+
+    NickEntry {
+        nick,
+        prefix,
+        modes,
+        away: false,
+        account: None,
+        ident,
+        host,
+    }
+}
+
+/// Parse `nick!user@host` into `(nick, Some(user), Some(host))`.
+/// If the format doesn't match, returns `(input, None, None)`.
+fn parse_userhost(input: &str) -> (String, Option<String>, Option<String>) {
+    if let Some(bang_pos) = input.find('!') {
+        let nick = &input[..bang_pos];
+        let rest = &input[bang_pos + 1..];
+        if let Some(at_pos) = rest.find('@') {
+            let ident = &rest[..at_pos];
+            let host = &rest[at_pos + 1..];
+            return (
+                nick.to_string(),
+                Some(ident.to_string()),
+                Some(host.to_string()),
+            );
+        }
+    }
+    (input.to_string(), None, None)
+}
+
+// === WHOX helpers ===
+
+/// Generate the next WHOX token for a connection and return it as a string.
+pub fn next_who_token(state: &mut AppState, conn_id: &str) -> String {
+    if let Some(conn) = state.connections.get_mut(conn_id) {
+        conn.who_token_counter = conn.who_token_counter.wrapping_add(1);
+        conn.who_token_counter.to_string()
+    } else {
+        "0".to_string()
+    }
+}
+
+/// Build a WHOX WHO command for the given channel.
+/// Returns `Some((target, fields_with_token))` if WHOX is available, `None` otherwise.
+///
+/// When `silent` is true, the channel is added to
+/// `Connection::silent_who_channels` so that reply handlers update
+/// nick state without displaying output (used for auto-WHO on join).
+pub fn build_whox_who(
+    state: &mut AppState,
+    conn_id: &str,
+    channel: &str,
+    silent: bool,
+) -> Option<(String, String)> {
+    let has_whox = state
+        .connections
+        .get(conn_id)
+        .is_some_and(|c| c.isupport_parsed.has_whox());
+
+    if has_whox {
+        let token = next_who_token(state, conn_id);
+        if silent && let Some(conn) = state.connections.get_mut(conn_id) {
+            conn.silent_who_channels.insert(channel.to_string());
+        }
+        let fields = format!("{},{token}", crate::constants::WHOX_FIELDS);
+        Some((channel.to_string(), fields))
+    } else {
+        None
+    }
+}
+
+/// Handle a WHOX reply (numeric 354 / `RPL_WHOSPCRPL`).
+///
+/// Our field selector `%tcuihnfar` produces responses with fields:
+///   `[our_nick, token, channel, user, ip, host, nick, flags, account, realname]`
+///
+/// Note: The irc crate treats 354 as `Command::Raw("354", args)` since it's non-standard.
+/// The `args` vec already has `our_nick` as the first element (the trailing prefix from the Raw parse).
+fn handle_whox_reply(state: &mut AppState, conn_id: &str, args: &[String]) {
+    tracing::trace!(conn_id, args_len = args.len(), ?args, "handle_whox_reply");
+    // Minimum fields: our_nick(0) + token(1) + channel(2) + user(3) + ip(4) + host(5)
+    //                + nick(6) + flags(7) + account(8) + realname(9)
+    if args.len() < 10 {
+        tracing::warn!(
+            conn_id,
+            args_len = args.len(),
+            "WHOX reply too short, skipping"
+        );
+        return;
+    }
+
+    // args[1] is the WHOX token
+    let channel = &args[2];
+    let user = &args[3];
+    // args[4] is IP
+    let host = &args[5];
+    let nick = &args[6];
+    let flags = &args[7];
+    let account_raw = &args[8];
+    let realname = &args[9];
+
+    // Auto-WHO replies are silent — update state only, no display
+    let silent = state
+        .connections
+        .get(conn_id)
+        .is_some_and(|c| contains_case_insensitive(&c.silent_who_channels, channel));
+
+    // Parse away status from flags: H = here, G = gone
+    let away = flags.starts_with('G');
+
+    // Parse account: "0" means not logged in
+    let account = (account_raw != "0").then(|| account_raw.clone());
+
+    // Update NickEntry in the channel buffer
+    let buffer_id = make_buffer_id(conn_id, channel);
+    if let Some(buf) = state.buffers.get_mut(&buffer_id)
+        && let Some(entry) = buf.users.get_mut(&nick.to_lowercase())
+    {
+        tracing::trace!(%nick, %channel, %away, ?account, "WHOX: updating nick entry");
+        entry.ident = Some(user.clone());
+        entry.host = Some(host.clone());
+        entry.account.clone_from(&account);
+        entry.away = away;
+    } else {
+        tracing::warn!(%nick, %channel, %buffer_id, "WHOX: buffer or nick not found for update");
+    }
+
+    // Only display for manual /who — auto-WHO on join is silent
+    if !silent {
+        let target_buf = active_or_server_buffer(state, conn_id);
+        let account_str = account.as_deref().unwrap_or("");
+        emit(
+            state,
+            &target_buf,
+            &format!(
+                "%Zc0caf5{nick}%Z565f89 ({user}@{host}) [{flags}] {channel}%Za9b1d6 {realname}%Z565f89 [{account_str}]%N"
+            ),
+        );
+    }
+}
+
+/// Best-effort E2E decryption for an incoming PRIVMSG. Returns the
+/// decrypted plaintext as an owned `String` when the wire line parses and
+/// decrypts successfully; returns `None` otherwise (leaving `text`
+/// untouched for the rest of `handle_privmsg`).
+///
+/// The `sender_handle` must be built from the raw IRC prefix (`ident@host`)
+/// — that is what the `E2eManager` keyring is keyed on. On `MissingKey`
+/// the function also enqueues an outbound KEYREQ (subject to the
+/// per-peer rate limiter) addressed back to `sender_nick` so the
+/// initiator-side handshake starts automatically the first time an
+/// encrypted line arrives from an unknown peer.
+fn try_decrypt_e2e(
+    state: &mut AppState,
+    conn_id: &str,
+    sender_nick: &str,
+    sender_handle: &str,
+    channel: &str,
+    text: &str,
+    is_own: bool,
+) -> Option<String> {
+    let mgr = state.e2e_manager.clone()?;
+    if !text.starts_with("+RPE2E01") {
+        return None;
+    }
+    // Our own echo-message echo of an encrypted PRIVMSG is not a thing
+    // we can decrypt (we have no incoming session keyed on our own
+    // handle), and firing an auto-KEYREQ here would (a) send a NOTICE
+    // to ourselves that goes nowhere and (b) leave a stale entry in
+    // `self.pending` that blocks later reciprocal KEYREQs in
+    // `/e2e accept`. `input.rs::handle_plain_message` already wrote a
+    // local plaintext echo before the server round-tripped the wire
+    // back to us, so the correct response is to swallow the echoed
+    // ciphertext entirely. Returning `Some("")` suppresses the raw
+    // wire from leaking into the buffer.
+    if is_own {
+        return Some(String::new());
+    }
+    match mgr.decrypt_incoming(sender_handle, channel, text) {
+        Ok(crate::e2e::manager::DecryptOutcome::Plaintext(s)) => Some(s),
+        Ok(crate::e2e::manager::DecryptOutcome::MissingKey {
+            handle,
+            channel: ch,
+        }) => {
+            // No session yet — fire a KEYREQ to the sender if the rate
+            // limiter allows. The message will stay hidden behind the
+            // placeholder until the responder's KEYRSP installs the
+            // session; after that, subsequent ciphertext lines decrypt
+            // normally.
+            if mgr.allow_keyreq(&handle) {
+                match mgr.build_keyreq_for_peer(&ch, Some(&handle)) {
+                    Ok(req) => {
+                        let ctcp = mgr.encode_keyreq_ctcp(&req);
+                        state.pending_e2e_sends.push(crate::state::PendingE2eSend {
+                            connection_id: conn_id.to_string(),
+                            target: sender_nick.to_string(),
+                            notice_text: ctcp,
+                        });
+                    }
+                    Err(e) => tracing::warn!("build_keyreq failed for {ch}: {e}"),
+                }
+            }
+            Some(format!("[E2E: awaiting session with {handle}]"))
+        }
+        Ok(crate::e2e::manager::DecryptOutcome::Rejected(reason)) => {
+            Some(format!("[E2E rejected: {reason}]"))
+        }
+        Err(e) => {
+            tracing::warn!("e2e decrypt error on {channel}: {e}");
+            None
+        }
+    }
+}
+
+/// Outcome of attempting to dispatch a CTCP body as an RPE2E handshake.
+#[derive(Debug, PartialEq, Eq)]
+enum RpEe2eOutcome {
+    /// Message was an RPE2E CTCP and has been fully handled — do not
+    /// render it in the normal NOTICE/PRIVMSG buffer.
+    Handled,
+    /// Not RPE2E traffic — caller continues with normal rendering.
+    NotE2e,
+}
+
+/// Try to dispatch an incoming CTCP body as an RPE2E KEYREQ/KEYRSP.
+/// Returns `None` if the E2E manager is not initialized (caller treats
+/// this as "not handled" and falls through to the default rendering).
+/// Returns `Some(Handled)` if the body was an RPE2E CTCP (even if the
+/// crypto rejected it — we still want to suppress the raw body from
+/// surfacing in the UI). Returns `Some(NotE2e)` if the body was not a
+/// RPEE2E tag so the caller can keep rendering it.
+#[expect(
+    clippy::too_many_lines,
+    reason = "RPE2E handshake dispatch keeps request/response flow together"
+)]
+fn try_dispatch_rpe2e_ctcp(
+    state: &mut AppState,
+    conn_id: &str,
+    prefix: Option<&Prefix>,
+    target: &str,
+    text: &str,
+) -> Option<RpEe2eOutcome> {
+    use crate::e2e::handshake::HandshakeMsg;
+
+    // Strip optional CTCP framing \x01...\x01. Servers sometimes drop the
+    // trailing byte, so accept both variants and anything in between.
+    let trimmed = text.strip_prefix('\x01').unwrap_or(text);
+    let inner = trimmed.strip_suffix('\x01').unwrap_or(trimmed);
+    if !inner.starts_with(crate::e2e::handshake::CTCP_TAG) {
+        return Some(RpEe2eOutcome::NotE2e);
+    }
+    let mgr = state.e2e_manager.clone()?;
+
+    let (nick, ident, host) = extract_nick_userhost(prefix);
+    let sender_handle = format!("{ident}@{host}");
+    let parsed = match crate::e2e::handshake::parse(inner) {
+        Ok(Some(msg)) => msg,
+        Ok(None) => return Some(RpEe2eOutcome::NotE2e),
+        Err(e) => {
+            tracing::warn!("rpe2e handshake parse error: {e}");
+            emit_e2e_debug(
+                state,
+                conn_id,
+                None,
+                format!("[E2E debug] RX handshake parse error from {sender_handle}: {e}"),
+            );
+            return Some(RpEe2eOutcome::Handled); // suppress bad body
+        }
+    };
+    // RPEE2E target is always us — the channel being negotiated is
+    // carried inside the payload rather than in the IRC target.
+    let _ = target;
+
+    match parsed {
+        HandshakeMsg::Req(req) => {
+            emit_e2e_debug(
+                state,
+                conn_id,
+                Some(&req.channel),
+                format!(
+                    "[E2E debug] RX KEYREQ from {nick} ({sender_handle}) for {}",
+                    req.channel
+                ),
+            );
+            let result = mgr.handle_keyreq_with_nick(&sender_handle, Some(&nick), &req);
+            surface_pending_trust_changes(state, conn_id, &mgr);
+            surface_pending_accept_requests(state, conn_id, &mgr);
+            match result {
+                Ok(Some(rsp)) => {
+                    let body = mgr.encode_keyrsp_ctcp(&rsp);
+                    state.pending_e2e_sends.push(crate::state::PendingE2eSend {
+                        connection_id: conn_id.to_string(),
+                        target: nick.clone(),
+                        notice_text: body,
+                    });
+                    emit_e2e_debug(
+                        state,
+                        conn_id,
+                        Some(&req.channel),
+                        format!("[E2E debug] queued KEYRSP to {nick} for {}", req.channel),
+                    );
+                    // Symmetric handshake (spec §5.3, G13): drain any
+                    // reciprocal KEYREQs queued by `handle_keyreq` so
+                    // the us→peer direction gets a fresh NOTICE in the
+                    // same tick as the KEYRSP. Each reciprocal targets
+                    // the same peer who just initiated the handshake.
+                    for out in mgr.take_pending_outbound_keyreqs() {
+                        let ctcp = mgr.encode_keyreq_ctcp(&out.req);
+                        state.pending_e2e_sends.push(crate::state::PendingE2eSend {
+                            connection_id: conn_id.to_string(),
+                            target: nick.clone(),
+                            notice_text: ctcp,
+                        });
+                        emit_e2e_debug(
+                            state,
+                            conn_id,
+                            Some(&out.channel),
+                            format!(
+                                "[E2E debug] queued reciprocal KEYREQ to {nick} for {}",
+                                out.channel
+                            ),
+                        );
+                    }
+                    Some(RpEe2eOutcome::Handled)
+                }
+                Ok(None) => {
+                    emit_e2e_debug(
+                        state,
+                        conn_id,
+                        Some(&req.channel),
+                        format!(
+                            "[E2E debug] KEYREQ from {nick} ({sender_handle}) is pending on {}",
+                            req.channel
+                        ),
+                    );
+                    Some(RpEe2eOutcome::Handled)
+                }
+                Err(e) => {
+                    tracing::warn!("handle_keyreq error: {e}");
+                    emit_e2e_debug(
+                        state,
+                        conn_id,
+                        Some(&req.channel),
+                        format!(
+                            "[E2E debug] KEYREQ from {nick} ({sender_handle}) failed on {}: {e}",
+                            req.channel
+                        ),
+                    );
+                    Some(RpEe2eOutcome::Handled)
+                }
+            }
+        }
+        HandshakeMsg::Rsp(rsp) => {
+            emit_e2e_debug(
+                state,
+                conn_id,
+                Some(&rsp.channel),
+                format!(
+                    "[E2E debug] RX KEYRSP from {nick} ({sender_handle}) for {}",
+                    rsp.channel
+                ),
+            );
+            let result = mgr.handle_keyrsp(&sender_handle, &rsp);
+            surface_pending_trust_changes(state, conn_id, &mgr);
+            if let Err(e) = result {
+                tracing::warn!("handle_keyrsp error: {e}");
+                emit_e2e_debug(
+                    state,
+                    conn_id,
+                    Some(&rsp.channel),
+                    format!(
+                        "[E2E debug] KEYRSP from {nick} ({sender_handle}) failed on {}: {e}",
+                        rsp.channel
+                    ),
+                );
+            } else {
+                emit_e2e_debug(
+                    state,
+                    conn_id,
+                    Some(&rsp.channel),
+                    format!(
+                        "[E2E debug] KEYRSP from {nick} ({sender_handle}) installed session on {}",
+                        rsp.channel
+                    ),
+                );
+            }
+            Some(RpEe2eOutcome::Handled)
+        }
+        HandshakeMsg::Rekey(rekey) => {
+            emit_e2e_debug(
+                state,
+                conn_id,
+                Some(&rekey.channel),
+                format!(
+                    "[E2E debug] RX REKEY from {nick} ({sender_handle}) for {}",
+                    rekey.channel
+                ),
+            );
+            let result = mgr.handle_rekey(&sender_handle, &rekey);
+            surface_pending_trust_changes(state, conn_id, &mgr);
+            if let Err(e) = result {
+                tracing::warn!("handle_rekey error: {e}");
+                emit_e2e_debug(
+                    state,
+                    conn_id,
+                    Some(&rekey.channel),
+                    format!(
+                        "[E2E debug] REKEY from {nick} ({sender_handle}) failed on {}: {e}",
+                        rekey.channel
+                    ),
+                );
+            } else {
+                emit_e2e_debug(
+                    state,
+                    conn_id,
+                    Some(&rekey.channel),
+                    format!(
+                        "[E2E debug] REKEY from {nick} ({sender_handle}) applied on {}",
+                        rekey.channel
+                    ),
+                );
+            }
+            Some(RpEe2eOutcome::Handled)
+        }
+    }
+}
+
+fn e2e_debug_enabled() -> bool {
+    std::env::var("REPARTEE_E2E_DEBUG_BUFFER").is_ok_and(|v| {
+        let v = v.trim();
+        !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+    })
+}
+
+fn emit_e2e_debug(
+    state: &mut AppState,
+    conn_id: &str,
+    channel: Option<&str>,
+    text: impl Into<String>,
+) {
+    if !e2e_debug_enabled() {
+        return;
+    }
+    let text = text.into();
+    let target_buffer = channel
+        .map(|channel| make_buffer_id(conn_id, channel))
+        .filter(|id| state.buffers.contains_key(id))
+        .unwrap_or_else(|| active_or_server_buffer(state, conn_id));
+    let id = state.next_message_id();
+    let event_param = text.clone();
+    state.add_message(
+        &target_buffer,
+        Message {
+            id,
+            timestamp: Utc::now(),
+            message_type: MessageType::Event,
+            nick: None,
+            nick_mode: None,
+            text,
+            highlight: false,
+            event_key: Some("e2e_info".to_string()),
+            event_params: Some(vec![event_param]),
+            log_msg_id: None,
+            log_ref_id: None,
+            tags: None,
+        },
+    );
+}
+
+fn emit_e2e_message(
+    state: &mut AppState,
+    buffer_id: &str,
+    event_key: &str,
+    highlight: bool,
+    text: String,
+) {
+    let id = state.next_message_id();
+    state.add_message(
+        buffer_id,
+        Message {
+            id,
+            timestamp: Utc::now(),
+            message_type: MessageType::Event,
+            nick: None,
+            nick_mode: None,
+            text: text.clone(),
+            highlight,
+            event_key: Some(event_key.to_string()),
+            event_params: Some(vec![text]),
+            log_msg_id: None,
+            log_ref_id: None,
+            tags: None,
+        },
+    );
+}
+
+fn parse_userhost_reply(entry: &str) -> Option<(String, String)> {
+    let (nick_part, userhost_part) = entry.split_once('=')?;
+    let nick = nick_part.trim_end_matches('*');
+    let userhost = userhost_part
+        .strip_prefix('+')
+        .or_else(|| userhost_part.strip_prefix('-'))
+        .unwrap_or(userhost_part);
+    let (ident, host) = userhost.split_once('@')?;
+    Some((nick.to_string(), format!("{ident}@{host}")))
+}
+
+fn handle_userhost_reply(state: &mut AppState, conn_id: &str, args: &[String]) {
+    if state.pending_userhost_requests.is_empty() || args.len() < 2 {
+        return;
+    }
+    let replies = args[1..].join(" ");
+    for entry in replies.split_whitespace() {
+        let Some((nick, handle)) = parse_userhost_reply(entry) else {
+            continue;
+        };
+        let mut idx = 0usize;
+        while idx < state.pending_userhost_requests.len() {
+            let req = &state.pending_userhost_requests[idx];
+            if req.connection_id != conn_id || !req.nick.eq_ignore_ascii_case(&nick) {
+                idx += 1;
+                continue;
+            }
+            let req = state.pending_userhost_requests.remove(idx);
+            match req.action {
+                crate::state::PendingUserhostAction::E2eForget {
+                    buffer_id,
+                    target,
+                    channel,
+                    all,
+                } => {
+                    let Some(mgr) = state.e2e_manager.clone() else {
+                        emit_e2e_message(
+                            state,
+                            &buffer_id,
+                            "e2e_error",
+                            true,
+                            "USERHOST resolved but E2E is disabled".to_string(),
+                        );
+                        continue;
+                    };
+                    let result = if all {
+                        mgr.forget_peer_everywhere(&handle)
+                    } else if let Some(channel) = channel.as_deref() {
+                        mgr.forget_peer_on_channel(&handle, channel)
+                    } else {
+                        emit_e2e_message(
+                            state,
+                            &buffer_id,
+                            "e2e_error",
+                            true,
+                            format!("/e2e forget: no channel context for {target}"),
+                        );
+                        continue;
+                    };
+                    match result {
+                        Ok(deleted) if all => emit_e2e_message(
+                            state,
+                            &buffer_id,
+                            "e2e_warning",
+                            false,
+                            format!(
+                                "forgot {target} ({handle}) globally — removed {deleted} row(s)"
+                            ),
+                        ),
+                        Ok(deleted) => emit_e2e_message(
+                            state,
+                            &buffer_id,
+                            "e2e_warning",
+                            false,
+                            format!(
+                                "forgot {target} ({handle}) on {} — removed {deleted} row(s)",
+                                channel.unwrap_or_default()
+                            ),
+                        ),
+                        Err(e) => emit_e2e_message(
+                            state,
+                            &buffer_id,
+                            "e2e_error",
+                            true,
+                            format!("/e2e forget: {e}"),
+                        ),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Drain all pending TOFU warnings from the manager and emit them as
+/// themed `[E2E]` event messages. Each notice targets the channel the
+/// handshake referenced (from the KEYREQ/KEYRSP payload); if that channel
+/// has no buffer yet the message falls back to the active-or-server
+/// buffer so the warning still reaches the user.
+fn surface_pending_trust_changes(
+    state: &mut AppState,
+    conn_id: &str,
+    mgr: &crate::e2e::E2eManager,
+) {
+    use crate::e2e::manager::TrustChange;
+    let notices = mgr.take_pending_trust_changes();
+    if notices.is_empty() {
+        return;
+    }
+    for notice in notices {
+        let target_buffer = if notice.channel.is_empty() {
+            active_or_server_buffer(state, conn_id)
+        } else {
+            let cand = make_buffer_id(conn_id, &notice.channel);
+            if state.buffers.contains_key(&cand) {
+                cand
+            } else {
+                active_or_server_buffer(state, conn_id)
+            }
+        };
+        let (text, event_key) = match &notice.change {
+            TrustChange::FingerprintChanged {
+                handle,
+                old_fp,
+                new_fp,
+            } => {
+                let old_hex = hex::encode(old_fp);
+                let new_hex = hex::encode(new_fp);
+                let short_old = &old_hex[..old_hex.len().min(16)];
+                let short_new = &new_hex[..new_hex.len().min(16)];
+                (
+                    format!(
+                        "[E2E] WARNING: {handle} identity key has CHANGED\n      \
+                         old fp: {short_old}\n      \
+                         new fp: {short_new}\n      \
+                         run /e2e reverify {handle} to accept the new key"
+                    ),
+                    "e2e_error",
+                )
+            }
+            TrustChange::HandleChanged {
+                old_handle,
+                new_handle,
+                fingerprint,
+            } => {
+                let fp_hex = hex::encode(fingerprint);
+                let short = &fp_hex[..fp_hex.len().min(16)];
+                (
+                    format!(
+                        "[E2E] notice: known key {short} appeared under new handle\n      \
+                         old handle: {old_handle}\n      \
+                         new handle: {new_handle}\n      \
+                         run /e2e reverify {new_handle} to accept"
+                    ),
+                    "e2e_warning",
+                )
+            }
+            TrustChange::Revoked {
+                handle,
+                fingerprint,
+            } => {
+                let fp_hex = hex::encode(fingerprint);
+                let short = &fp_hex[..fp_hex.len().min(16)];
+                (
+                    format!(
+                        "[E2E] ERROR: peer {handle} (fp={short}) is REVOKED; \
+                         handshake refused. run /e2e unrevoke {handle} to restore"
+                    ),
+                    "e2e_error",
+                )
+            }
+            // Known / New never produce a notice but we match exhaustively.
+            TrustChange::Known | TrustChange::New => continue,
+        };
+        let id = state.next_message_id();
+        state.add_message(
+            &target_buffer,
+            Message {
+                id,
+                timestamp: Utc::now(),
+                message_type: MessageType::Event,
+                nick: None,
+                nick_mode: None,
+                text,
+                highlight: true,
+                event_key: Some(event_key.to_string()),
+                event_params: None,
+                log_msg_id: None,
+                log_ref_id: None,
+                tags: None,
+            },
+        );
+    }
+}
+
+/// Drain the manager's Normal-mode pending-accept queue and render each
+/// prompt in the buffer that corresponds to the channel carried in the
+/// KEYREQ payload. Falls back to the active-or-server buffer if that
+/// channel has no local buffer yet (e.g. PM pseudochannel before the
+/// Query buffer exists).
+fn surface_pending_accept_requests(
+    state: &mut AppState,
+    conn_id: &str,
+    mgr: &crate::e2e::E2eManager,
+) {
+    let requests = mgr.take_pending_accept_requests();
+    if requests.is_empty() {
+        return;
+    }
+    for req in requests {
+        let target_buffer = if req.channel.is_empty() {
+            active_or_server_buffer(state, conn_id)
+        } else {
+            let cand = make_buffer_id(conn_id, &req.channel);
+            if state.buffers.contains_key(&cand) {
+                cand
+            } else {
+                active_or_server_buffer(state, conn_id)
+            }
+        };
+        let text = format!(
+            "[E2E] Pending key exchange from {who} for {channel}.\n      \
+             Run /e2e accept <nick> or /e2e decline <nick>.",
+            who = req.nick.as_ref().map_or_else(
+                || req.handle.clone(),
+                |nick| format!("{nick} ({})", req.handle)
+            ),
+            channel = req.channel,
+        );
+        let id = state.next_message_id();
+        state.add_message(
+            &target_buffer,
+            Message {
+                id,
+                timestamp: Utc::now(),
+                message_type: MessageType::Event,
+                nick: None,
+                nick_mode: None,
+                text,
+                highlight: true,
+                event_key: Some("e2e_pending_accept".to_string()),
+                event_params: None,
+                log_msg_id: None,
+                log_ref_id: None,
+                tags: None,
+            },
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::connection::Connection;
+    use chrono::{Datelike, Timelike};
+    use irc::proto::Prefix;
+    use std::collections::HashMap;
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "flat fixture used by every test in this module"
+    )]
+    fn make_test_state() -> AppState {
+        let mut state = AppState::new();
+        state.add_connection(Connection {
+            id: "test".to_string(),
+            label: "TestServer".to_string(),
+            status: ConnectionStatus::Connected,
+            nick: "me".to_string(),
+            user_modes: String::new(),
+            isupport: HashMap::new(),
+            isupport_parsed: crate::irc::isupport::Isupport::new(),
+            error: None,
+            lag: None,
+            lag_pending: false,
+            reconnect_attempts: 0,
+            reconnect_delay_secs: 30,
+            next_reconnect: None,
+            should_reconnect: true,
+            joined_channels: Vec::new(),
+            origin_config: crate::config::ServerConfig {
+                label: "TestServer".to_string(),
+                address: "irc.test.net".to_string(),
+                port: 6697,
+                tls: true,
+                tls_verify: true,
+                autoconnect: false,
+                channels: vec![],
+                nick: None,
+                username: None,
+                realname: None,
+                password: None,
+                sasl_user: None,
+                sasl_pass: None,
+                bind_ip: None,
+                encoding: None,
+                auto_reconnect: Some(true),
+                reconnect_delay: None,
+                reconnect_max_retries: None,
+                autosendcmd: None,
+                sasl_mechanism: None,
+                client_cert_path: None,
+            },
+            local_ip: None,
+            enabled_caps: std::collections::HashSet::new(),
+            who_token_counter: 0,
+            silent_who_channels: std::collections::HashSet::new(),
+            silent_banlist_channels: std::collections::HashSet::new(),
+        });
+        // Server buffer
+        state.add_buffer(Buffer {
+            id: make_buffer_id("test", "TestServer"),
+            connection_id: "test".to_string(),
+            buffer_type: BufferType::Server,
+            name: "TestServer".to_string(),
+            messages: VecDeque::new(),
+            activity: ActivityLevel::None,
+            unread_count: 0,
+            last_read: Utc::now(),
+            topic: None,
+            topic_set_by: None,
+            users: HashMap::new(),
+            modes: None,
+            mode_params: None,
+            list_modes: HashMap::new(),
+            last_speakers: Vec::new(),
+            peer_handle: None,
+            log_total_lines: None,
+            log_oldest_ts: None,
+            log_newest_ts: None,
+            history_exhausted: false,
+            log_initial_loaded: false,
+        });
+        // Channel buffer
+        let chan_id = make_buffer_id("test", "#test");
+        state.add_buffer(Buffer {
+            id: chan_id.clone(),
+            connection_id: "test".to_string(),
+            buffer_type: BufferType::Channel,
+            name: "#test".to_string(),
+            messages: VecDeque::new(),
+            activity: ActivityLevel::None,
+            unread_count: 0,
+            last_read: Utc::now(),
+            topic: None,
+            topic_set_by: None,
+            users: HashMap::new(),
+            modes: None,
+            mode_params: None,
+            list_modes: HashMap::new(),
+            last_speakers: Vec::new(),
+            peer_handle: None,
+            log_total_lines: None,
+            log_oldest_ts: None,
+            log_newest_ts: None,
+            history_exhausted: false,
+            log_initial_loaded: false,
+        });
+        // Add ourselves to the channel
+        state.add_nick(
+            &chan_id,
+            NickEntry {
+                nick: "me".to_string(),
+                prefix: String::new(),
+                modes: String::new(),
+                away: false,
+                account: None,
+                ident: None,
+                host: None,
+            },
+        );
+        state
+    }
+
+    fn make_channel_buffer(conn_id: &str, name: &str) -> Buffer {
+        Buffer {
+            id: make_buffer_id(conn_id, name),
+            connection_id: conn_id.to_string(),
+            buffer_type: BufferType::Channel,
+            name: name.to_string(),
+            messages: VecDeque::new(),
+            activity: ActivityLevel::None,
+            unread_count: 0,
+            last_read: Utc::now(),
+            topic: None,
+            topic_set_by: None,
+            users: std::collections::HashMap::new(),
+            modes: None,
+            mode_params: None,
+            list_modes: std::collections::HashMap::new(),
+            last_speakers: Vec::new(),
+            peer_handle: None,
+            log_total_lines: None,
+            log_oldest_ts: None,
+            log_newest_ts: None,
+            history_exhausted: false,
+            log_initial_loaded: false,
+        }
+    }
+
+    fn make_irc_msg(prefix: Option<&str>, command: Command) -> IrcMessage {
+        IrcMessage {
+            tags: None,
+            prefix: prefix.map(Prefix::new_from_str),
+            command,
+        }
+    }
+
+    // === handle_privmsg tests ===
+
+    #[test]
+    fn privmsg_to_channel() {
+        let mut state = make_test_state();
+        let msg = make_irc_msg(
+            Some("alice!user@host"),
+            Command::PRIVMSG("#test".into(), "hello".into()),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert_eq!(buf.messages.len(), 1);
+        assert_eq!(buf.messages[0].text, "hello");
+        assert_eq!(buf.messages[0].nick.as_deref(), Some("alice"));
+        assert_eq!(buf.messages[0].message_type, MessageType::Message);
+    }
+
+    #[test]
+    fn privmsg_pm_creates_query_buffer() {
+        let mut state = make_test_state();
+        let msg = make_irc_msg(
+            Some("bob!user@host"),
+            Command::PRIVMSG("me".into(), "hi there".into()),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/bob").unwrap();
+        assert_eq!(buf.buffer_type, BufferType::Query);
+        assert_eq!(buf.messages.len(), 1);
+        assert_eq!(buf.messages[0].text, "hi there");
+    }
+
+    #[test]
+    fn privmsg_mention_sets_highlight() {
+        let mut state = make_test_state();
+        // Set active buffer to something else so activity is tracked
+        state.set_active_buffer("test/testserver");
+        let msg = make_irc_msg(
+            Some("alice!user@host"),
+            Command::PRIVMSG("#test".into(), "hey me, how are you?".into()),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert!(buf.messages[0].highlight);
+        assert_eq!(buf.activity, ActivityLevel::Mention);
+    }
+
+    #[test]
+    fn privmsg_own_message_no_activity() {
+        let mut state = make_test_state();
+        state.set_active_buffer("test/testserver"); // switch away
+        let msg = make_irc_msg(
+            Some("me!user@host"),
+            Command::PRIVMSG("#test".into(), "my own message".into()),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert_eq!(buf.activity, ActivityLevel::None);
+    }
+
+    #[test]
+    fn privmsg_ctcp_action() {
+        let mut state = make_test_state();
+        let msg = make_irc_msg(
+            Some("alice!user@host"),
+            Command::PRIVMSG("#test".into(), "\x01ACTION waves\x01".into()),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert_eq!(buf.messages[0].message_type, MessageType::Action);
+        assert_eq!(buf.messages[0].text, "waves");
+    }
+
+    #[test]
+    fn privmsg_ctcp_action_mention() {
+        let mut state = make_test_state();
+        state.set_active_buffer("test/testserver");
+        let msg = make_irc_msg(
+            Some("alice!user@host"),
+            Command::PRIVMSG("#test".into(), "\x01ACTION pokes me\x01".into()),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert_eq!(buf.messages[0].message_type, MessageType::Action);
+        assert!(buf.messages[0].highlight);
+        assert_eq!(buf.activity, ActivityLevel::Mention);
+    }
+
+    #[test]
+    fn privmsg_flood_exemption_bypasses_duplicate_flood() {
+        let mut state = make_test_state();
+        state.flood_exemptions.push("*!*@trusted.host".to_string());
+        for text in ["spam", "a", "spam", "b", "spam"] {
+            let msg = make_irc_msg(
+                Some("alice!~user@trusted.host"),
+                Command::PRIVMSG("#test".into(), text.into()),
+            );
+            handle_irc_message(&mut state, "test", &msg);
+        }
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        let spam_count = buf.messages.iter().filter(|msg| msg.text == "spam").count();
+        assert_eq!(spam_count, 3);
+    }
+
+    // === handle_join tests ===
+
+    #[test]
+    fn join_our_own_creates_buffer() {
+        let mut state = make_test_state();
+        let msg = make_irc_msg(
+            Some("me!user@host"),
+            Command::JOIN("#newchan".into(), None, None),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        assert!(state.buffers.contains_key("test/#newchan"));
+        let buf = state.buffers.get("test/#newchan").unwrap();
+        assert_eq!(buf.buffer_type, BufferType::Channel);
+    }
+
+    #[test]
+    fn join_other_user_adds_nick() {
+        let mut state = make_test_state();
+        let msg = make_irc_msg(
+            Some("carol!user@host"),
+            Command::JOIN("#test".into(), None, None),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert!(buf.users.contains_key("carol"));
+        // Should also have a join event message
+        assert!(
+            buf.messages
+                .back()
+                .unwrap()
+                .text
+                .contains("carol (user@host) has joined")
+        );
+    }
+
+    // === handle_part tests ===
+
+    #[test]
+    fn part_our_own_removes_buffer() {
+        let mut state = make_test_state();
+        let msg = make_irc_msg(
+            Some("me!user@host"),
+            Command::PART("#test".into(), Some("bye".into())),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        assert!(!state.buffers.contains_key("test/#test"));
+    }
+
+    #[test]
+    fn part_other_user_removes_nick() {
+        let mut state = make_test_state();
+        // First add another user
+        state.add_nick(
+            "test/#test",
+            NickEntry {
+                nick: "dave".to_string(),
+                prefix: String::new(),
+                modes: String::new(),
+                away: false,
+                account: None,
+                ident: None,
+                host: None,
+            },
+        );
+        let msg = make_irc_msg(
+            Some("dave!user@host"),
+            Command::PART("#test".into(), Some("leaving".into())),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert!(!buf.users.contains_key("dave"));
+        assert!(
+            buf.messages
+                .back()
+                .unwrap()
+                .text
+                .contains("dave (user@host) has left")
+        );
+    }
+
+    // === handle_quit tests ===
+
+    #[test]
+    fn quit_removes_from_all_buffers() {
+        let mut state = make_test_state();
+        // Add user to channel
+        state.add_nick(
+            "test/#test",
+            NickEntry {
+                nick: "eve".to_string(),
+                prefix: String::new(),
+                modes: String::new(),
+                away: false,
+                account: None,
+                ident: None,
+                host: None,
+            },
+        );
+        let msg = make_irc_msg(Some("eve!user@host"), Command::QUIT(Some("gone".into())));
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert!(!buf.users.contains_key("eve"));
+        assert!(
+            buf.messages
+                .back()
+                .unwrap()
+                .text
+                .contains("eve (user@host) has quit")
+        );
+    }
+
+    // === handle_nick_change tests ===
+
+    #[test]
+    fn nick_change_updates_our_nick() {
+        let mut state = make_test_state();
+        let msg = make_irc_msg(Some("me!user@host"), Command::NICK("me_".into()));
+        handle_irc_message(&mut state, "test", &msg);
+
+        assert_eq!(state.connections.get("test").unwrap().nick, "me_");
+    }
+
+    #[test]
+    fn nick_change_other_user() {
+        let mut state = make_test_state();
+        state.add_nick(
+            "test/#test",
+            NickEntry {
+                nick: "frank".to_string(),
+                prefix: "@".to_string(),
+                modes: "o".to_string(),
+                away: false,
+                account: None,
+                ident: None,
+                host: None,
+            },
+        );
+        let msg = make_irc_msg(Some("frank!user@host"), Command::NICK("frankie".into()));
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert!(!buf.users.contains_key("frank"));
+        assert!(buf.users.contains_key("frankie"));
+        assert!(
+            buf.messages
+                .back()
+                .unwrap()
+                .text
+                .contains("frank is now known as frankie")
+        );
+    }
+
+    // === handle_kick tests ===
+
+    #[test]
+    fn kick_our_own_removes_buffer_and_notifies() {
+        let mut state = make_test_state();
+        let msg = make_irc_msg(
+            Some("op!user@host"),
+            Command::KICK("#test".into(), "me".into(), Some("behave".into())),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        // Channel buffer is removed.
+        assert!(!state.buffers.contains_key("test/#test"));
+
+        // Kick message appears in server buffer.
+        let server_id = make_buffer_id("test", "TestServer");
+        let server_buf = state.buffers.get(&server_id).unwrap();
+        let server_msg = server_buf.messages.back().unwrap();
+        assert!(server_msg.text.contains("You were kicked from #test by op"));
+        assert!(server_msg.text.contains("behave"));
+        assert!(server_msg.highlight);
+        assert_eq!(server_msg.event_key.as_deref(), Some("kicked"));
+    }
+
+    #[test]
+    fn kick_other_user_removes_nick() {
+        let mut state = make_test_state();
+        state.add_nick(
+            "test/#test",
+            NickEntry {
+                nick: "troll".to_string(),
+                prefix: String::new(),
+                modes: String::new(),
+                away: false,
+                account: None,
+                ident: None,
+                host: None,
+            },
+        );
+        let msg = make_irc_msg(
+            Some("op!user@host"),
+            Command::KICK("#test".into(), "troll".into(), Some("bye".into())),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert!(!buf.users.contains_key("troll"));
+        assert!(
+            buf.messages
+                .back()
+                .unwrap()
+                .text
+                .contains("troll was kicked by op")
+        );
+    }
+
+    // === handle_topic tests ===
+
+    #[test]
+    fn topic_change_updates_buffer() {
+        let mut state = make_test_state();
+        let msg = make_irc_msg(
+            Some("alice!user@host"),
+            Command::TOPIC("#test".into(), Some("new topic".into())),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert_eq!(buf.topic.as_deref(), Some("new topic"));
+        assert_eq!(buf.topic_set_by.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn registered_only_and_reop_render_distinct_mode_letters() {
+        let registered = [irc::proto::Mode::Plus(
+            irc::proto::ChannelMode::RegisteredOnly,
+            None,
+        )];
+        let reop = [irc::proto::Mode::Plus(
+            irc::proto::ChannelMode::Reop,
+            Some("*!*@ops".to_string()),
+        )];
+
+        assert_eq!(build_channel_mode_string(&registered), "+r");
+        assert_eq!(build_channel_mode_string(&reop), "+R *!*@ops");
+    }
+
+    #[test]
+    fn reop_mode_is_list_mode_not_channel_mode() {
+        let mut state = make_test_state();
+        let msg = IrcMessage::new(
+            Some("oper!user@host"),
+            "MODE",
+            vec!["#test", "+R", "*!*@ops"],
+        )
+        .unwrap();
+
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert!(buf.modes.as_deref().is_none_or(str::is_empty));
+        assert_eq!(
+            buf.messages.back().unwrap().text,
+            "oper sets mode +R *!*@ops on #test"
+        );
+    }
+
+    #[test]
+    fn ban_mode_adds_cached_ban_entry() {
+        let mut state = make_test_state();
+        let msg = IrcMessage::new(
+            Some("oper!user@host"),
+            "MODE",
+            vec!["#test", "+b", "*!*@bad.example"],
+        )
+        .unwrap();
+
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        let bans = buf.list_modes.get(BAN_MODE_KEY).unwrap();
+        assert_eq!(bans.len(), 1);
+        assert_eq!(bans[0].mask, "*!*@bad.example");
+        assert_eq!(bans[0].set_by, "oper");
+        assert!(bans[0].set_at > 0);
+    }
+
+    #[test]
+    fn unban_mode_removes_cached_ban_entry_case_insensitively() {
+        let mut state = make_test_state();
+
+        for (mode, mask) in [("+b", "*!*@Bad.Example"), ("-b", "*!*@bad.example")] {
+            let msg =
+                IrcMessage::new(Some("oper!user@host"), "MODE", vec!["#test", mode, mask]).unwrap();
+            handle_irc_message(&mut state, "test", &msg);
+        }
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert!(buf.list_modes.get(BAN_MODE_KEY).is_none_or(Vec::is_empty));
+    }
+
+    #[test]
+    fn list_mode_batches_preserve_parameters_in_display() {
+        let cases = [
+            ("+RRR", "oper sets mode +RRR a b c on #test"),
+            ("-RRR", "oper sets mode -RRR a b c on #test"),
+            ("+eee", "oper sets mode +eee a b c on #test"),
+            ("-eee", "oper sets mode -eee a b c on #test"),
+            ("+III", "oper sets mode +III a b c on #test"),
+            ("-III", "oper sets mode -III a b c on #test"),
+        ];
+
+        for (mode, expected) in cases {
+            let mut state = make_test_state();
+            let msg = IrcMessage::new(
+                Some("oper!user@host"),
+                "MODE",
+                vec!["#test", mode, "a", "b", "c"],
+            )
+            .unwrap();
+
+            handle_irc_message(&mut state, "test", &msg);
+
+            let buf = state.buffers.get("test/#test").unwrap();
+            assert_eq!(buf.messages.back().unwrap().text, expected);
+        }
+    }
+
+    // === handle_response (numerics) tests ===
+
+    #[test]
+    fn rpl_namreply_adds_nicks() {
+        let mut state = make_test_state();
+        let msg = make_irc_msg(
+            None,
+            Command::Response(
+                Response::RPL_NAMREPLY,
+                vec![
+                    "me".into(),
+                    "=".into(),
+                    "#test".into(),
+                    "@op +voice regular".into(),
+                ],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert!(buf.users.contains_key("op"));
+        assert_eq!(buf.users.get("op").unwrap().prefix, "@");
+        assert_eq!(buf.users.get("op").unwrap().modes, "o");
+        assert!(buf.users.contains_key("voice"));
+        assert_eq!(buf.users.get("voice").unwrap().prefix, "+");
+        assert_eq!(buf.users.get("voice").unwrap().modes, "v");
+        assert!(buf.users.contains_key("regular"));
+        assert_eq!(buf.users.get("regular").unwrap().prefix, "");
+    }
+
+    // === parse_names_entry unit tests (multi-prefix + userhost-in-names) ===
+
+    #[test]
+    fn parse_names_standard_single_prefix() {
+        let prefix_map = vec![('o', '@'), ('v', '+')];
+        let entry = parse_names_entry("@nick", &prefix_map, false);
+        assert_eq!(entry.nick, "nick");
+        assert_eq!(entry.prefix, "@");
+        assert_eq!(entry.modes, "o");
+        assert!(entry.ident.is_none());
+        assert!(entry.host.is_none());
+    }
+
+    #[test]
+    fn parse_names_no_prefix() {
+        let prefix_map = vec![('o', '@'), ('v', '+')];
+        let entry = parse_names_entry("regular", &prefix_map, false);
+        assert_eq!(entry.nick, "regular");
+        assert_eq!(entry.prefix, "");
+        assert_eq!(entry.modes, "");
+    }
+
+    #[test]
+    fn parse_names_multi_prefix_two_modes() {
+        let prefix_map = vec![('o', '@'), ('v', '+')];
+        let entry = parse_names_entry("@+nick", &prefix_map, false);
+        assert_eq!(entry.nick, "nick");
+        assert_eq!(entry.prefix, "@+");
+        assert_eq!(entry.modes, "ov");
+        assert!(entry.ident.is_none());
+        assert!(entry.host.is_none());
+    }
+
+    #[test]
+    fn parse_names_multi_prefix_five_modes() {
+        let prefix_map = vec![('q', '~'), ('a', '&'), ('o', '@'), ('h', '%'), ('v', '+')];
+        let entry = parse_names_entry("~&@%+nick", &prefix_map, false);
+        assert_eq!(entry.nick, "nick");
+        assert_eq!(entry.prefix, "~&@%+");
+        assert_eq!(entry.modes, "qaohv");
+    }
+
+    #[test]
+    fn parse_names_userhost_in_names() {
+        let prefix_map = vec![('o', '@'), ('v', '+')];
+        let entry = parse_names_entry("@+nick!user@host.com", &prefix_map, true);
+        assert_eq!(entry.nick, "nick");
+        assert_eq!(entry.prefix, "@+");
+        assert_eq!(entry.modes, "ov");
+        assert_eq!(entry.ident.as_deref(), Some("user"));
+        assert_eq!(entry.host.as_deref(), Some("host.com"));
+    }
+
+    #[test]
+    fn parse_names_userhost_no_prefix() {
+        let prefix_map = vec![('o', '@'), ('v', '+')];
+        let entry = parse_names_entry("nick!user@host.com", &prefix_map, true);
+        assert_eq!(entry.nick, "nick");
+        assert_eq!(entry.prefix, "");
+        assert_eq!(entry.modes, "");
+        assert_eq!(entry.ident.as_deref(), Some("user"));
+        assert_eq!(entry.host.as_deref(), Some("host.com"));
+    }
+
+    #[test]
+    fn parse_names_userhost_not_enabled_preserves_raw_nick() {
+        // Without userhost-in-names, nick!user@host is treated as the nick
+        let prefix_map = vec![('o', '@'), ('v', '+')];
+        let entry = parse_names_entry("@nick!user@host.com", &prefix_map, false);
+        assert_eq!(entry.nick, "nick!user@host.com");
+        assert_eq!(entry.prefix, "@");
+        assert_eq!(entry.modes, "o");
+        assert!(entry.ident.is_none());
+        assert!(entry.host.is_none());
+    }
+
+    // === parse_names_entry integration via RPL_NAMREPLY ===
+
+    #[test]
+    fn rpl_namreply_multi_prefix() {
+        let mut state = make_test_state();
+        // Set PREFIX=(ov)@+ on the connection's isupport
+        if let Some(conn) = state.connections.get_mut("test") {
+            conn.isupport_parsed.parse_tokens(&["PREFIX=(ov)@+"]);
+        }
+        let msg = make_irc_msg(
+            None,
+            Command::Response(
+                Response::RPL_NAMREPLY,
+                vec![
+                    "me".into(),
+                    "=".into(),
+                    "#test".into(),
+                    "@+alice @bob +carol regular".into(),
+                ],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        let alice = buf.users.get("alice").unwrap();
+        assert_eq!(alice.prefix, "@+");
+        assert_eq!(alice.modes, "ov");
+        let bob = buf.users.get("bob").unwrap();
+        assert_eq!(bob.prefix, "@");
+        assert_eq!(bob.modes, "o");
+        let carol = buf.users.get("carol").unwrap();
+        assert_eq!(carol.prefix, "+");
+        assert_eq!(carol.modes, "v");
+        let regular = buf.users.get("regular").unwrap();
+        assert_eq!(regular.prefix, "");
+        assert_eq!(regular.modes, "");
+    }
+
+    #[test]
+    fn rpl_namreply_userhost_in_names() {
+        let mut state = make_test_state();
+        if let Some(conn) = state.connections.get_mut("test") {
+            conn.isupport_parsed.parse_tokens(&["PREFIX=(ov)@+"]);
+            conn.enabled_caps.insert("userhost-in-names".to_string());
+        }
+        let msg = make_irc_msg(
+            None,
+            Command::Response(
+                Response::RPL_NAMREPLY,
+                vec![
+                    "me".into(),
+                    "=".into(),
+                    "#test".into(),
+                    "@+alice!auser@ahost.net bob!buser@bhost.org".into(),
+                ],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        let alice = buf.users.get("alice").unwrap();
+        assert_eq!(alice.prefix, "@+");
+        assert_eq!(alice.modes, "ov");
+        assert_eq!(alice.ident.as_deref(), Some("auser"));
+        assert_eq!(alice.host.as_deref(), Some("ahost.net"));
+        let bob = buf.users.get("bob").unwrap();
+        assert_eq!(bob.prefix, "");
+        assert_eq!(bob.modes, "");
+        assert_eq!(bob.ident.as_deref(), Some("buser"));
+        assert_eq!(bob.host.as_deref(), Some("bhost.org"));
+    }
+
+    #[test]
+    fn rpl_topic_sets_topic() {
+        let mut state = make_test_state();
+        let msg = make_irc_msg(
+            None,
+            Command::Response(
+                Response::RPL_TOPIC,
+                vec!["me".into(), "#test".into(), "Welcome!".into()],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert_eq!(buf.topic.as_deref(), Some("Welcome!"));
+    }
+
+    // === handle_connected / handle_disconnected tests ===
+
+    #[test]
+    fn connected_updates_status() {
+        let mut state = make_test_state();
+        state.update_connection_status("test", ConnectionStatus::Connecting);
+        handle_connected(&mut state, "test");
+
+        assert_eq!(
+            state.connections.get("test").unwrap().status,
+            ConnectionStatus::Connected
+        );
+    }
+
+    #[test]
+    fn disconnected_with_error() {
+        let mut state = make_test_state();
+        handle_disconnected(&mut state, "test", Some("timeout"));
+
+        let conn = state.connections.get("test").unwrap();
+        assert_eq!(conn.status, ConnectionStatus::Error);
+        assert_eq!(conn.error.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn disconnected_clean() {
+        let mut state = make_test_state();
+        handle_disconnected(&mut state, "test", None);
+
+        assert_eq!(
+            state.connections.get("test").unwrap().status,
+            ConnectionStatus::Disconnected
+        );
+    }
+
+    // === handle_notice tests ===
+
+    #[test]
+    fn notice_from_server_goes_to_status() {
+        let mut state = make_test_state();
+        let msg = make_irc_msg(
+            Some("irc.server.com"),
+            Command::NOTICE("*".into(), "*** Looking up your hostname".into()),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/testserver").unwrap();
+        assert!(buf.messages.back().unwrap().text.contains("Looking up"));
+        assert_eq!(
+            buf.messages.back().unwrap().message_type,
+            MessageType::Notice
+        );
+    }
+
+    // === extended-join tests ===
+
+    #[test]
+    fn extended_join_with_account() {
+        let mut state = make_test_state();
+        // extended-join: JOIN #channel account :Real Name
+        let msg = make_irc_msg(
+            Some("carol!user@host"),
+            Command::JOIN(
+                "#test".into(),
+                Some("patrick".into()),
+                Some("Real Name".into()),
+            ),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert!(buf.users.contains_key("carol"));
+        let entry = buf.users.get("carol").unwrap();
+        assert_eq!(entry.account.as_deref(), Some("patrick"));
+
+        // Join message should include account and realname
+        let join_msg = buf.messages.back().unwrap();
+        assert!(join_msg.text.contains("[patrick]"));
+        assert!(join_msg.text.contains("Real Name"));
+        let params = join_msg.event_params.as_ref().unwrap();
+        assert_eq!(params[4], "[patrick]"); // $4 = account
+        assert_eq!(params[5], "Real Name"); // $5 = realname
+    }
+
+    #[test]
+    fn extended_join_without_account() {
+        let mut state = make_test_state();
+        // extended-join with "*" means not logged in
+        let msg = make_irc_msg(
+            Some("carol!user@host"),
+            Command::JOIN("#test".into(), Some("*".into()), Some("Real Name".into())),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert!(buf.users.contains_key("carol"));
+        let entry = buf.users.get("carol").unwrap();
+        assert_eq!(entry.account, None);
+    }
+
+    #[test]
+    fn standard_join_no_account() {
+        let mut state = make_test_state();
+        // Standard JOIN (1 arg) — no account info
+        let msg = make_irc_msg(
+            Some("carol!user@host"),
+            Command::JOIN("#test".into(), None, None),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert!(buf.users.contains_key("carol"));
+        let entry = buf.users.get("carol").unwrap();
+        assert_eq!(entry.account, None);
+    }
+
+    // === account-notify tests ===
+
+    #[test]
+    fn account_notify_login() {
+        let mut state = make_test_state();
+        // Add user to channel first
+        state.add_nick(
+            "test/#test",
+            NickEntry {
+                nick: "alice".to_string(),
+                prefix: String::new(),
+                modes: String::new(),
+                away: false,
+                account: None,
+                ident: None,
+                host: None,
+            },
+        );
+
+        let msg = make_irc_msg(
+            Some("alice!user@host"),
+            Command::ACCOUNT("alice_account".into()),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        let entry = buf.users.get("alice").unwrap();
+        assert_eq!(entry.account.as_deref(), Some("alice_account"));
+        // Should have an event message
+        assert!(
+            buf.messages
+                .back()
+                .unwrap()
+                .text
+                .contains("alice is now logged in as alice_account")
+        );
+    }
+
+    #[test]
+    fn account_notify_logout() {
+        let mut state = make_test_state();
+        // Add user with an account
+        state.add_nick(
+            "test/#test",
+            NickEntry {
+                nick: "alice".to_string(),
+                prefix: String::new(),
+                modes: String::new(),
+                away: false,
+                account: Some("alice_account".to_string()),
+                ident: None,
+                host: None,
+            },
+        );
+
+        let msg = make_irc_msg(Some("alice!user@host"), Command::ACCOUNT("*".into()));
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        let entry = buf.users.get("alice").unwrap();
+        assert_eq!(entry.account, None);
+        assert!(
+            buf.messages
+                .back()
+                .unwrap()
+                .text
+                .contains("alice has logged out")
+        );
+    }
+
+    #[test]
+    fn account_notify_updates_all_shared_buffers() {
+        let mut state = make_test_state();
+        // Create a second channel buffer
+        let chan2_id = make_buffer_id("test", "#other");
+        state.add_buffer(Buffer {
+            id: chan2_id,
+            connection_id: "test".to_string(),
+            buffer_type: BufferType::Channel,
+            name: "#other".to_string(),
+            messages: VecDeque::new(),
+            activity: ActivityLevel::None,
+            unread_count: 0,
+            last_read: Utc::now(),
+            topic: None,
+            topic_set_by: None,
+            users: HashMap::new(),
+            modes: None,
+            mode_params: None,
+            list_modes: HashMap::new(),
+            last_speakers: Vec::new(),
+            peer_handle: None,
+            log_total_lines: None,
+            log_oldest_ts: None,
+            log_newest_ts: None,
+            history_exhausted: false,
+            log_initial_loaded: false,
+        });
+
+        // Add alice to both channels
+        for buf_id in &["test/#test", "test/#other"] {
+            state.add_nick(
+                buf_id,
+                NickEntry {
+                    nick: "alice".to_string(),
+                    prefix: String::new(),
+                    modes: String::new(),
+                    away: false,
+                    account: None,
+                    ident: None,
+                    host: None,
+                },
+            );
+        }
+
+        let msg = make_irc_msg(
+            Some("alice!user@host"),
+            Command::ACCOUNT("alice_acct".into()),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        // Both buffers should have the account updated
+        let entry1 = state
+            .buffers
+            .get("test/#test")
+            .unwrap()
+            .users
+            .get("alice")
+            .unwrap();
+        assert_eq!(entry1.account.as_deref(), Some("alice_acct"));
+        let entry2 = state
+            .buffers
+            .get("test/#other")
+            .unwrap()
+            .users
+            .get("alice")
+            .unwrap();
+        assert_eq!(entry2.account.as_deref(), Some("alice_acct"));
+    }
+
+    // === away-notify tests ===
+
+    #[test]
+    fn away_notify_sets_away() {
+        let mut state = make_test_state();
+        // Add user to channel
+        state.add_nick(
+            "test/#test",
+            NickEntry {
+                nick: "alice".to_string(),
+                prefix: String::new(),
+                modes: String::new(),
+                away: false,
+                account: None,
+                ident: None,
+                host: None,
+            },
+        );
+
+        let msg = make_irc_msg(
+            Some("alice!user@host"),
+            Command::AWAY(Some("Gone fishing".into())),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        let entry = buf.users.get("alice").unwrap();
+        assert!(
+            entry.away,
+            "NickEntry.away should be true after AWAY with reason"
+        );
+        // Should NOT add event messages (too noisy)
+        assert!(
+            buf.messages.is_empty(),
+            "away-notify should not add event messages"
+        );
+    }
+
+    #[test]
+    fn away_notify_clears_away() {
+        let mut state = make_test_state();
+        // Add user already marked away
+        state.add_nick(
+            "test/#test",
+            NickEntry {
+                nick: "alice".to_string(),
+                prefix: String::new(),
+                modes: String::new(),
+                away: true,
+                account: None,
+                ident: None,
+                host: None,
+            },
+        );
+
+        let msg = make_irc_msg(Some("alice!user@host"), Command::AWAY(None));
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        let entry = buf.users.get("alice").unwrap();
+        assert!(
+            !entry.away,
+            "NickEntry.away should be false after AWAY without reason"
+        );
+        assert!(
+            buf.messages.is_empty(),
+            "away-notify should not add event messages"
+        );
+    }
+
+    #[test]
+    fn away_notify_updates_all_shared_buffers() {
+        let mut state = make_test_state();
+        // Create a second channel buffer
+        let chan2_id = make_buffer_id("test", "#other");
+        state.add_buffer(Buffer {
+            id: chan2_id,
+            connection_id: "test".to_string(),
+            buffer_type: BufferType::Channel,
+            name: "#other".to_string(),
+            messages: VecDeque::new(),
+            activity: ActivityLevel::None,
+            unread_count: 0,
+            last_read: Utc::now(),
+            topic: None,
+            topic_set_by: None,
+            users: HashMap::new(),
+            modes: None,
+            mode_params: None,
+            list_modes: HashMap::new(),
+            last_speakers: Vec::new(),
+            peer_handle: None,
+            log_total_lines: None,
+            log_oldest_ts: None,
+            log_newest_ts: None,
+            history_exhausted: false,
+            log_initial_loaded: false,
+        });
+
+        // Add alice to both channels
+        for buf_id in &["test/#test", "test/#other"] {
+            state.add_nick(
+                buf_id,
+                NickEntry {
+                    nick: "alice".to_string(),
+                    prefix: String::new(),
+                    modes: String::new(),
+                    away: false,
+                    account: None,
+                    ident: None,
+                    host: None,
+                },
+            );
+        }
+
+        let msg = make_irc_msg(Some("alice!user@host"), Command::AWAY(Some("BRB".into())));
+        handle_irc_message(&mut state, "test", &msg);
+
+        // Both buffers should have away = true
+        let entry1 = state
+            .buffers
+            .get("test/#test")
+            .unwrap()
+            .users
+            .get("alice")
+            .unwrap();
+        assert!(entry1.away);
+        let entry2 = state
+            .buffers
+            .get("test/#other")
+            .unwrap()
+            .users
+            .get("alice")
+            .unwrap();
+        assert!(entry2.away);
+    }
+
+    // === chghost tests ===
+
+    #[test]
+    fn chghost_updates_ident_and_host() {
+        let mut state = make_test_state();
+        // Add user to channel
+        state.add_nick(
+            "test/#test",
+            NickEntry {
+                nick: "alice".to_string(),
+                prefix: String::new(),
+                modes: String::new(),
+                away: false,
+                account: None,
+                ident: Some("olduser".to_string()),
+                host: Some("oldhost.example.com".to_string()),
+            },
+        );
+
+        let msg = make_irc_msg(
+            Some("alice!olduser@oldhost.example.com"),
+            Command::CHGHOST("newuser".into(), "newhost.example.com".into()),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        let entry = buf.users.get("alice").unwrap();
+        assert_eq!(entry.ident.as_deref(), Some("newuser"));
+        assert_eq!(entry.host.as_deref(), Some("newhost.example.com"));
+    }
+
+    #[test]
+    fn chghost_adds_event_message() {
+        let mut state = make_test_state();
+        // Add user to channel
+        state.add_nick(
+            "test/#test",
+            NickEntry {
+                nick: "alice".to_string(),
+                prefix: String::new(),
+                modes: String::new(),
+                away: false,
+                account: None,
+                ident: None,
+                host: None,
+            },
+        );
+
+        let msg = make_irc_msg(
+            Some("alice!olduser@oldhost"),
+            Command::CHGHOST("newident".into(), "new.host.net".into()),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert_eq!(buf.messages.len(), 1);
+        let event = &buf.messages[0];
+        assert_eq!(event.message_type, MessageType::Event);
+        assert!(
+            event
+                .text
+                .contains("alice changed host to newident@new.host.net")
+        );
+        assert_eq!(event.event_key.as_deref(), Some("chghost"));
+    }
+
+    #[test]
+    fn chghost_updates_all_shared_buffers() {
+        let mut state = make_test_state();
+        // Create a second channel buffer
+        let chan2_id = make_buffer_id("test", "#other");
+        state.add_buffer(Buffer {
+            id: chan2_id,
+            connection_id: "test".to_string(),
+            buffer_type: BufferType::Channel,
+            name: "#other".to_string(),
+            messages: VecDeque::new(),
+            activity: ActivityLevel::None,
+            unread_count: 0,
+            last_read: Utc::now(),
+            topic: None,
+            topic_set_by: None,
+            users: HashMap::new(),
+            modes: None,
+            mode_params: None,
+            list_modes: HashMap::new(),
+            last_speakers: Vec::new(),
+            peer_handle: None,
+            log_total_lines: None,
+            log_oldest_ts: None,
+            log_newest_ts: None,
+            history_exhausted: false,
+            log_initial_loaded: false,
+        });
+
+        // Add alice to both channels
+        for buf_id in &["test/#test", "test/#other"] {
+            state.add_nick(
+                buf_id,
+                NickEntry {
+                    nick: "alice".to_string(),
+                    prefix: String::new(),
+                    modes: String::new(),
+                    away: false,
+                    account: None,
+                    ident: None,
+                    host: None,
+                },
+            );
+        }
+
+        let msg = make_irc_msg(
+            Some("alice!user@host"),
+            Command::CHGHOST("changed".into(), "vhost.net".into()),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        // Both buffers should have updated ident/host
+        let entry1 = state
+            .buffers
+            .get("test/#test")
+            .unwrap()
+            .users
+            .get("alice")
+            .unwrap();
+        assert_eq!(entry1.ident.as_deref(), Some("changed"));
+        assert_eq!(entry1.host.as_deref(), Some("vhost.net"));
+        let entry2 = state
+            .buffers
+            .get("test/#other")
+            .unwrap()
+            .users
+            .get("alice")
+            .unwrap();
+        assert_eq!(entry2.ident.as_deref(), Some("changed"));
+        assert_eq!(entry2.host.as_deref(), Some("vhost.net"));
+
+        // Both buffers should have event messages
+        assert_eq!(state.buffers.get("test/#test").unwrap().messages.len(), 1);
+        assert_eq!(state.buffers.get("test/#other").unwrap().messages.len(), 1);
+    }
+
+    // === account-tag tests ===
+
+    #[test]
+    fn account_tag_updates_nick_entry_on_privmsg() {
+        let mut state = make_test_state();
+        // Add alice to channel without an account
+        state.add_nick(
+            "test/#test",
+            NickEntry {
+                nick: "alice".to_string(),
+                prefix: String::new(),
+                modes: String::new(),
+                away: false,
+                account: None,
+                ident: None,
+                host: None,
+            },
+        );
+
+        // PRIVMSG with account tag
+        let mut msg = make_irc_msg(
+            Some("alice!user@host"),
+            Command::PRIVMSG("#test".into(), "hello".into()),
+        );
+        msg.tags = Some(vec![irc::proto::message::Tag(
+            "account".to_string(),
+            Some("alice_acct".to_string()),
+        )]);
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        let entry = buf.users.get("alice").unwrap();
+        assert_eq!(entry.account.as_deref(), Some("alice_acct"));
+    }
+
+    #[test]
+    fn extended_join_account_on_own_join() {
+        let mut state = make_test_state();
+        // Our own extended-join — should create buffer and not crash
+        // (account tracking for self is less critical but shouldn't break)
+        let msg = make_irc_msg(
+            Some("me!user@host"),
+            Command::JOIN(
+                "#newchan".into(),
+                Some("my_account".into()),
+                Some("My Real Name".into()),
+            ),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        assert!(state.buffers.contains_key("test/#newchan"));
+        let buf = state.buffers.get("test/#newchan").unwrap();
+        assert_eq!(buf.buffer_type, BufferType::Channel);
+    }
+
+    // === server-time tests ===
+
+    #[test]
+    fn server_time_tag_used_as_timestamp() {
+        let mut state = make_test_state();
+        let mut msg = make_irc_msg(
+            Some("alice!user@host"),
+            Command::PRIVMSG("#test".into(), "hello from the past".into()),
+        );
+        msg.tags = Some(vec![irc::proto::message::Tag(
+            "time".to_string(),
+            Some("2020-06-15T10:30:00.000Z".to_string()),
+        )]);
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        let ts = buf.messages[0].timestamp;
+        assert_eq!(ts.year(), 2020);
+        assert_eq!(ts.month(), 6);
+        assert_eq!(ts.day(), 15);
+        assert_eq!(ts.hour(), 10);
+        assert_eq!(ts.minute(), 30);
+    }
+
+    #[test]
+    fn missing_time_tag_falls_back_to_now() {
+        let mut state = make_test_state();
+        let before = Utc::now();
+        let msg = make_irc_msg(
+            Some("alice!user@host"),
+            Command::PRIVMSG("#test".into(), "hello".into()),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+        let after = Utc::now();
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        let ts = buf.messages[0].timestamp;
+        assert!(
+            ts >= before && ts <= after,
+            "timestamp should be approximately now"
+        );
+    }
+
+    #[test]
+    fn malformed_time_tag_falls_back_to_now() {
+        let mut state = make_test_state();
+        let before = Utc::now();
+        let mut msg = make_irc_msg(
+            Some("alice!user@host"),
+            Command::PRIVMSG("#test".into(), "hello".into()),
+        );
+        msg.tags = Some(vec![irc::proto::message::Tag(
+            "time".to_string(),
+            Some("not-a-timestamp".to_string()),
+        )]);
+        handle_irc_message(&mut state, "test", &msg);
+        let after = Utc::now();
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        let ts = buf.messages[0].timestamp;
+        assert!(
+            ts >= before && ts <= after,
+            "malformed tag should fall back to now"
+        );
+    }
+
+    #[test]
+    fn server_time_helper_unit() {
+        // Valid RFC 3339 timestamp
+        let mut tags = HashMap::new();
+        tags.insert("time".to_string(), "2023-01-15T08:45:30.123Z".to_string());
+        let ts = message_timestamp(Some(&tags));
+        assert_eq!(ts.year(), 2023);
+        assert_eq!(ts.month(), 1);
+        assert_eq!(ts.day(), 15);
+        assert_eq!(ts.hour(), 8);
+        assert_eq!(ts.minute(), 45);
+        assert_eq!(ts.second(), 30);
+
+        // None tags → fallback
+        let before = Utc::now();
+        let ts = message_timestamp(None);
+        let after = Utc::now();
+        assert!(ts >= before && ts <= after);
+
+        // Malformed value → fallback
+        let mut bad = HashMap::new();
+        bad.insert("time".to_string(), "garbage".to_string());
+        let before = Utc::now();
+        let ts = message_timestamp(Some(&bad));
+        let after = Utc::now();
+        assert!(ts >= before && ts <= after);
+    }
+
+    // ── cap-notify tests ─────────────────────────────────────────────
+
+    #[test]
+    fn cap_new_desired_caps_returns_request_list() {
+        let mut state = make_test_state();
+        // Pre-enable some caps so they are NOT re-requested
+        if let Some(conn) = state.connections.get_mut("test") {
+            conn.enabled_caps.insert("multi-prefix".to_string());
+        }
+
+        // Server advertises new caps: one already enabled, one desired, one unknown
+        let to_request = handle_cap_new(
+            &mut state,
+            "test",
+            Some("multi-prefix echo-message unknown-cap"),
+            None,
+        );
+
+        // Should only request echo-message (multi-prefix already enabled, unknown-cap not desired)
+        assert_eq!(to_request, vec!["echo-message"]);
+
+        // Verify status message was logged
+        let buf = state
+            .buffers
+            .get(&make_buffer_id("test", "TestServer"))
+            .unwrap();
+        let last = buf.messages.back().unwrap();
+        assert!(
+            last.text.contains("echo-message"),
+            "should mention requested cap"
+        );
+        assert_eq!(last.event_key.as_deref(), Some("cap_new"));
+    }
+
+    #[test]
+    fn cap_new_non_desired_caps_ignored() {
+        let mut state = make_test_state();
+        let to_request =
+            handle_cap_new(&mut state, "test", Some("unknown-cap fancy-feature"), None);
+
+        assert!(to_request.is_empty(), "no desired caps should be requested");
+
+        let buf = state
+            .buffers
+            .get(&make_buffer_id("test", "TestServer"))
+            .unwrap();
+        let last = buf.messages.back().unwrap();
+        assert!(
+            last.text.contains("none requested"),
+            "should note nothing was requested"
+        );
+    }
+
+    #[test]
+    fn cap_new_with_values_strips_value_part() {
+        let mut state = make_test_state();
+        // Server sends caps with values (e.g. sasl=PLAIN,EXTERNAL)
+        let to_request = handle_cap_new(
+            &mut state,
+            "test",
+            Some("sasl=PLAIN,EXTERNAL server-time"),
+            None,
+        );
+
+        // Both are desired caps, neither enabled yet
+        assert!(to_request.contains(&"sasl".to_string()));
+        assert!(to_request.contains(&"server-time".to_string()));
+    }
+
+    #[test]
+    fn cap_del_removes_from_enabled() {
+        let mut state = make_test_state();
+        // Pre-enable some caps
+        if let Some(conn) = state.connections.get_mut("test") {
+            conn.enabled_caps.insert("multi-prefix".to_string());
+            conn.enabled_caps.insert("server-time".to_string());
+            conn.enabled_caps.insert("away-notify".to_string());
+        }
+
+        // Server removes multi-prefix and server-time
+        handle_cap_del(&mut state, "test", Some("multi-prefix server-time"), None);
+
+        let conn = state.connections.get("test").unwrap();
+        assert!(!conn.enabled_caps.contains("multi-prefix"));
+        assert!(!conn.enabled_caps.contains("server-time"));
+        assert!(
+            conn.enabled_caps.contains("away-notify"),
+            "untouched cap should remain"
+        );
+
+        let buf = state
+            .buffers
+            .get(&make_buffer_id("test", "TestServer"))
+            .unwrap();
+        let last = buf.messages.back().unwrap();
+        assert_eq!(last.event_key.as_deref(), Some("cap_del"));
+        assert!(last.text.contains("multi-prefix"));
+    }
+
+    #[test]
+    fn cap_del_for_non_enabled_caps_is_noop() {
+        let mut state = make_test_state();
+        // No caps enabled
+        handle_cap_del(&mut state, "test", Some("fancy-feature unknown-cap"), None);
+
+        let conn = state.connections.get("test").unwrap();
+        assert!(conn.enabled_caps.is_empty());
+
+        let buf = state
+            .buffers
+            .get(&make_buffer_id("test", "TestServer"))
+            .unwrap();
+        let last = buf.messages.back().unwrap();
+        assert!(last.text.contains("none were enabled"));
+    }
+
+    #[test]
+    fn cap_ack_adds_to_enabled() {
+        let mut state = make_test_state();
+        handle_cap_ack(&mut state, "test", Some("echo-message invite-notify"), None);
+
+        let conn = state.connections.get("test").unwrap();
+        assert!(conn.enabled_caps.contains("echo-message"));
+        assert!(conn.enabled_caps.contains("invite-notify"));
+
+        let buf = state
+            .buffers
+            .get(&make_buffer_id("test", "TestServer"))
+            .unwrap();
+        let last = buf.messages.back().unwrap();
+        assert_eq!(last.event_key.as_deref(), Some("cap_ack"));
+        assert!(last.text.contains("echo-message"));
+    }
+
+    #[test]
+    fn cap_nak_logs_rejection() {
+        let mut state = make_test_state();
+        handle_cap_nak(&mut state, "test", Some("echo-message"), None);
+
+        // NAK should NOT add to enabled_caps
+        let conn = state.connections.get("test").unwrap();
+        assert!(!conn.enabled_caps.contains("echo-message"));
+
+        let buf = state
+            .buffers
+            .get(&make_buffer_id("test", "TestServer"))
+            .unwrap();
+        let last = buf.messages.back().unwrap();
+        assert_eq!(last.event_key.as_deref(), Some("cap_nak"));
+        assert!(last.text.contains("echo-message"));
+    }
+
+    #[test]
+    fn extract_cap_string_field3_primary() {
+        // Normal case: caps in field3
+        assert_eq!(
+            extract_cap_string(Some("multi-prefix server-time"), None),
+            "multi-prefix server-time"
+        );
+    }
+
+    #[test]
+    fn extract_cap_string_continuation() {
+        // Continuation: field3 = "*", caps in field4
+        assert_eq!(
+            extract_cap_string(Some("*"), Some("batch echo-message")),
+            "batch echo-message"
+        );
+    }
+
+    #[test]
+    fn extract_cap_string_field4_preferred_when_present() {
+        // Both present (non-"*" field3): prefer field4 if non-empty
+        assert_eq!(
+            extract_cap_string(Some("some-prefix"), Some("actual-caps here")),
+            "actual-caps here"
+        );
+    }
+
+    #[test]
+    fn cap_new_full_roundtrip_with_ack() {
+        // Simulate: CAP NEW → filter → (caller sends REQ) → CAP ACK → enabled
+        let mut state = make_test_state();
+
+        // Step 1: CAP NEW announces echo-message and batch
+        let to_request = handle_cap_new(&mut state, "test", Some("echo-message batch"), None);
+        assert_eq!(to_request.len(), 2);
+        assert!(to_request.contains(&"echo-message".to_string()));
+        assert!(to_request.contains(&"batch".to_string()));
+
+        // Step 2: Server ACKs the request
+        handle_cap_ack(&mut state, "test", Some("echo-message batch"), None);
+
+        let conn = state.connections.get("test").unwrap();
+        assert!(conn.enabled_caps.contains("echo-message"));
+        assert!(conn.enabled_caps.contains("batch"));
+
+        // Step 3: Server later DELs batch
+        handle_cap_del(&mut state, "test", Some("batch"), None);
+
+        let conn = state.connections.get("test").unwrap();
+        assert!(
+            conn.enabled_caps.contains("echo-message"),
+            "echo-message should remain"
+        );
+        assert!(
+            !conn.enabled_caps.contains("batch"),
+            "batch should be removed"
+        );
+    }
+
+    // === echo-message tests ===
+
+    #[test]
+    fn echo_message_own_privmsg_displayed_when_cap_enabled() {
+        let mut state = make_test_state();
+        // Enable echo-message cap
+        state
+            .connections
+            .get_mut("test")
+            .unwrap()
+            .enabled_caps
+            .insert("echo-message".to_string());
+
+        // Server echoes our own PRIVMSG to #test
+        let msg = make_irc_msg(
+            Some("me!user@host"),
+            Command::PRIVMSG("#test".into(), "hello from echo".into()),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert_eq!(buf.messages.len(), 1, "echoed message should be displayed");
+        assert_eq!(buf.messages[0].text, "hello from echo");
+        assert_eq!(buf.messages[0].nick.as_deref(), Some("me"));
+        assert_eq!(buf.messages[0].message_type, MessageType::Message);
+    }
+
+    #[test]
+    fn echo_message_own_privmsg_no_cap_unchanged() {
+        let mut state = make_test_state();
+        // echo-message is NOT enabled (default)
+
+        // We receive our own PRIVMSG (unusual without echo-message, but handle gracefully)
+        let msg = make_irc_msg(
+            Some("me!user@host"),
+            Command::PRIVMSG("#test".into(), "my own message".into()),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert_eq!(buf.messages.len(), 1, "message should still be displayed");
+        assert_eq!(buf.messages[0].text, "my own message");
+        // Own messages should not trigger activity
+        assert_eq!(buf.activity, ActivityLevel::None);
+    }
+
+    #[test]
+    fn echo_message_own_pm_routes_to_recipient_buffer() {
+        let mut state = make_test_state();
+        state
+            .connections
+            .get_mut("test")
+            .unwrap()
+            .enabled_caps
+            .insert("echo-message".to_string());
+
+        // Server echoes our PM to "bob" — target is "bob", nick is "me"
+        let msg = make_irc_msg(
+            Some("me!user@host"),
+            Command::PRIVMSG("bob".into(), "hey bob".into()),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        // Should create a query buffer for "bob", not "me"
+        assert!(
+            state.buffers.contains_key("test/bob"),
+            "query buffer should be created for recipient"
+        );
+        assert!(
+            !state.buffers.contains_key("test/me"),
+            "should NOT create a buffer named after ourselves"
+        );
+        let buf = state.buffers.get("test/bob").unwrap();
+        assert_eq!(buf.buffer_type, BufferType::Query);
+        assert_eq!(buf.messages.len(), 1);
+        assert_eq!(buf.messages[0].text, "hey bob");
+        assert_eq!(buf.messages[0].nick.as_deref(), Some("me"));
+    }
+
+    #[test]
+    fn echo_message_own_action_displayed() {
+        let mut state = make_test_state();
+        state
+            .connections
+            .get_mut("test")
+            .unwrap()
+            .enabled_caps
+            .insert("echo-message".to_string());
+
+        let msg = make_irc_msg(
+            Some("me!user@host"),
+            Command::PRIVMSG("#test".into(), "\x01ACTION dances\x01".into()),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert_eq!(buf.messages.len(), 1);
+        assert_eq!(buf.messages[0].message_type, MessageType::Action);
+        assert_eq!(buf.messages[0].text, "dances");
+        assert_eq!(buf.messages[0].nick.as_deref(), Some("me"));
+    }
+
+    #[test]
+    fn echo_message_own_notice_routes_to_recipient() {
+        let mut state = make_test_state();
+        state
+            .connections
+            .get_mut("test")
+            .unwrap()
+            .enabled_caps
+            .insert("echo-message".to_string());
+
+        // Create a query buffer for "bob" so the notice has somewhere to go
+        state.add_buffer(Buffer {
+            id: make_buffer_id("test", "bob"),
+            connection_id: "test".to_string(),
+            buffer_type: BufferType::Query,
+            name: "bob".to_string(),
+            messages: VecDeque::new(),
+            activity: ActivityLevel::None,
+            unread_count: 0,
+            last_read: Utc::now(),
+            topic: None,
+            topic_set_by: None,
+            users: HashMap::new(),
+            modes: None,
+            mode_params: None,
+            list_modes: HashMap::new(),
+            last_speakers: Vec::new(),
+            peer_handle: None,
+            log_total_lines: None,
+            log_oldest_ts: None,
+            log_newest_ts: None,
+            history_exhausted: false,
+            log_initial_loaded: false,
+        });
+
+        // Server echoes our NOTICE to "bob"
+        let msg = make_irc_msg(
+            Some("me!user@host"),
+            Command::NOTICE("bob".into(), "notice to bob".into()),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/bob").unwrap();
+        assert_eq!(buf.messages.len(), 1);
+        assert_eq!(buf.messages[0].message_type, MessageType::Notice);
+        assert_eq!(buf.messages[0].text, "notice to bob");
+    }
+
+    // === invite-notify tests ===
+
+    #[test]
+    fn invite_target_is_us_shows_in_active_buffer() {
+        let mut state = make_test_state();
+        // Set active buffer to the channel so the invite message lands there
+        state.set_active_buffer("test/#test");
+
+        let msg = make_irc_msg(
+            Some("op!user@host"),
+            Command::INVITE("me".into(), "#secret".into()),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        // When we are the target, the message goes to the active buffer
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert_eq!(buf.messages.len(), 1);
+        assert_eq!(buf.messages[0].message_type, MessageType::Event);
+        assert_eq!(buf.messages[0].text, "op invites you to #secret");
+        assert!(buf.messages[0].highlight);
+    }
+
+    #[test]
+    fn invite_notify_other_user_shows_in_channel() {
+        let mut state = make_test_state();
+        // Set active buffer to server so we can verify the message goes to #test, not active
+        state.set_active_buffer("test/testserver");
+
+        let msg = make_irc_msg(
+            Some("op!user@host"),
+            Command::INVITE("alice".into(), "#test".into()),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        // invite-notify: message goes to the channel buffer, not the active buffer
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert_eq!(buf.messages.len(), 1);
+        assert_eq!(buf.messages[0].message_type, MessageType::Event);
+        assert_eq!(buf.messages[0].text, "op invited alice to #test");
+        assert!(!buf.messages[0].highlight);
+
+        // Server buffer should have no messages from this invite
+        let server_buf = state.buffers.get("test/testserver").unwrap();
+        assert_eq!(server_buf.messages.len(), 0);
+    }
+
+    // === WHOX tests ===
+
+    fn make_whox_state() -> AppState {
+        let mut state = make_test_state();
+        // Enable WHOX on the connection's ISUPPORT
+        if let Some(conn) = state.connections.get_mut("test") {
+            conn.isupport_parsed.parse_tokens(&["WHOX"]);
+        }
+        // Add some users to #test for WHOX updates
+        let chan_id = make_buffer_id("test", "#test");
+        state.add_nick(
+            &chan_id,
+            NickEntry {
+                nick: "alice".to_string(),
+                prefix: String::new(),
+                modes: String::new(),
+                away: false,
+                account: None,
+                ident: None,
+                host: None,
+            },
+        );
+        state.add_nick(
+            &chan_id,
+            NickEntry {
+                nick: "bob".to_string(),
+                prefix: "@".to_string(),
+                modes: "o".to_string(),
+                away: false,
+                account: None,
+                ident: None,
+                host: None,
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn whox_reply_updates_nick_entry() {
+        let mut state = make_whox_state();
+        state.set_active_buffer("test/testserver");
+
+        // WHOX 354 response: our_nick, token, channel, user, ip, host, nick, flags, account, realname
+        let msg = make_irc_msg(
+            None,
+            Command::Raw(
+                "354".to_string(),
+                vec![
+                    "me".to_string(),               // our_nick
+                    "1".to_string(),                // token
+                    "#test".to_string(),            // channel
+                    "~alice".to_string(),           // user
+                    "1.2.3.4".to_string(),          // ip
+                    "host.example.com".to_string(), // host
+                    "alice".to_string(),            // nick
+                    "H".to_string(),                // flags (H=here)
+                    "patrick".to_string(),          // account
+                    "Alice Smith".to_string(),      // realname
+                ],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        let entry = buf.users.get("alice").unwrap();
+        assert_eq!(entry.ident.as_deref(), Some("~alice"));
+        assert_eq!(entry.host.as_deref(), Some("host.example.com"));
+        assert_eq!(entry.account.as_deref(), Some("patrick"));
+        assert!(!entry.away);
+    }
+
+    #[test]
+    fn whox_account_zero_means_not_logged_in() {
+        let mut state = make_whox_state();
+        state.set_active_buffer("test/testserver");
+
+        let msg = make_irc_msg(
+            None,
+            Command::Raw(
+                "354".to_string(),
+                vec![
+                    "me".to_string(),
+                    "1".to_string(),
+                    "#test".to_string(),
+                    "~bob".to_string(),
+                    "5.6.7.8".to_string(),
+                    "bob.host.net".to_string(),
+                    "bob".to_string(),
+                    "H@".to_string(),
+                    "0".to_string(), // account="0" → not logged in
+                    "Bob Jones".to_string(),
+                ],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        let entry = buf.users.get("bob").unwrap();
+        assert!(entry.account.is_none());
+    }
+
+    #[test]
+    fn whox_gone_flag_sets_away() {
+        let mut state = make_whox_state();
+        state.set_active_buffer("test/testserver");
+
+        let msg = make_irc_msg(
+            None,
+            Command::Raw(
+                "354".to_string(),
+                vec![
+                    "me".to_string(),
+                    "1".to_string(),
+                    "#test".to_string(),
+                    "~alice".to_string(),
+                    "1.2.3.4".to_string(),
+                    "host.example.com".to_string(),
+                    "alice".to_string(),
+                    "G".to_string(), // G = gone/away
+                    "alice_acct".to_string(),
+                    "Alice".to_string(),
+                ],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        let entry = buf.users.get("alice").unwrap();
+        assert!(entry.away);
+    }
+
+    #[test]
+    fn whox_here_flag_clears_away() {
+        let mut state = make_whox_state();
+
+        // First set alice as away
+        let chan_id = make_buffer_id("test", "#test");
+        if let Some(buf) = state.buffers.get_mut(&chan_id)
+            && let Some(entry) = buf.users.get_mut("alice")
+        {
+            entry.away = true;
+        }
+        state.set_active_buffer("test/testserver");
+
+        let msg = make_irc_msg(
+            None,
+            Command::Raw(
+                "354".to_string(),
+                vec![
+                    "me".to_string(),
+                    "1".to_string(),
+                    "#test".to_string(),
+                    "~alice".to_string(),
+                    "1.2.3.4".to_string(),
+                    "host.example.com".to_string(),
+                    "alice".to_string(),
+                    "H".to_string(), // H = here (not away)
+                    "0".to_string(),
+                    "Alice".to_string(),
+                ],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        let entry = buf.users.get("alice").unwrap();
+        assert!(!entry.away);
+    }
+
+    #[test]
+    fn standard_who_reply_still_works() {
+        let mut state = make_test_state();
+        state.set_active_buffer("test/testserver");
+
+        // Standard RPL_WHOREPLY (352)
+        let msg = make_irc_msg(
+            None,
+            Command::Response(
+                Response::RPL_WHOREPLY,
+                vec![
+                    "me".to_string(),
+                    "#test".to_string(),
+                    "~user".to_string(),
+                    "host.com".to_string(),
+                    "irc.net".to_string(),
+                    "alice".to_string(),
+                    "H@".to_string(),
+                    "0 Real Name".to_string(),
+                ],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        // Should display in the active/server buffer
+        let buf = state.buffers.get("test/testserver").unwrap();
+        assert_eq!(buf.messages.len(), 1);
+        assert!(buf.messages[0].text.contains("alice"));
+    }
+
+    #[test]
+    fn whois_user_and_server_emit_theme_params() {
+        let mut state = make_test_state();
+        state.set_active_buffer("test/testserver");
+
+        for command in [
+            Command::Response(
+                Response::RPL_WHOISUSER,
+                vec![
+                    "me".to_string(),
+                    "alice".to_string(),
+                    "user".to_string(),
+                    "host.example".to_string(),
+                    "*".to_string(),
+                    "Alice Example".to_string(),
+                ],
+            ),
+            Command::Response(
+                Response::RPL_WHOISSERVER,
+                vec![
+                    "me".to_string(),
+                    "alice".to_string(),
+                    "irc.example".to_string(),
+                    "Example IRCd".to_string(),
+                ],
+            ),
+        ] {
+            let msg = make_irc_msg(None, command);
+            handle_irc_message(&mut state, "test", &msg);
+        }
+
+        let buf = state.buffers.get("test/testserver").unwrap();
+        let keys: Vec<&str> = buf
+            .messages
+            .iter()
+            .filter_map(|msg| msg.event_key.as_deref())
+            .collect();
+
+        assert_eq!(keys, vec!["whois_header", "whois", "whois_server"]);
+        assert_eq!(
+            buf.messages[1].event_params.as_deref(),
+            Some(
+                &[
+                    "alice".to_string(),
+                    "user".to_string(),
+                    "host.example".to_string(),
+                    "Alice Example".to_string(),
+                ][..]
+            )
+        );
+        assert_eq!(
+            buf.messages[2].event_params.as_deref(),
+            Some(
+                &[
+                    "alice".to_string(),
+                    "irc.example".to_string(),
+                    "Example IRCd".to_string(),
+                    " (Example IRCd)".to_string(),
+                ][..]
+            )
+        );
+    }
+
+    #[test]
+    fn whois_detail_responses_emit_theme_keys() {
+        let mut state = make_test_state();
+        state.set_active_buffer("test/testserver");
+
+        for command in [
+            Command::Response(
+                Response::RPL_WHOISOPERATOR,
+                vec![
+                    "me".to_string(),
+                    "alice".to_string(),
+                    "is an IRC operator".to_string(),
+                ],
+            ),
+            Command::Response(
+                Response::RPL_WHOISIDLE,
+                vec![
+                    "me".to_string(),
+                    "alice".to_string(),
+                    "65".to_string(),
+                    "1700000000".to_string(),
+                ],
+            ),
+            Command::Response(
+                Response::RPL_WHOISCHANNELS,
+                vec![
+                    "me".to_string(),
+                    "alice".to_string(),
+                    "@#ops +#chat".to_string(),
+                ],
+            ),
+            Command::Response(
+                Response::RPL_WHOISCERTFP,
+                vec![
+                    "me".to_string(),
+                    "alice".to_string(),
+                    "0123456789abcdef".to_string(),
+                ],
+            ),
+            Command::Response(
+                Response::RPL_WHOISKEYVALUE,
+                vec![
+                    "me".to_string(),
+                    "alice".to_string(),
+                    "metadata".to_string(),
+                    "public".to_string(),
+                    "value".to_string(),
+                ],
+            ),
+            Command::Response(
+                Response::RPL_AWAY,
+                vec![
+                    "me".to_string(),
+                    "alice".to_string(),
+                    "gone for lunch".to_string(),
+                ],
+            ),
+            Command::Response(
+                Response::RPL_ENDOFWHOIS,
+                vec![
+                    "me".to_string(),
+                    "alice".to_string(),
+                    "End of WHOIS".to_string(),
+                ],
+            ),
+        ] {
+            let msg = make_irc_msg(None, command);
+            handle_irc_message(&mut state, "test", &msg);
+        }
+
+        let buf = state.buffers.get("test/testserver").unwrap();
+        let keys: Vec<&str> = buf
+            .messages
+            .iter()
+            .filter_map(|msg| msg.event_key.as_deref())
+            .collect();
+
+        assert_eq!(
+            keys,
+            vec![
+                "whois_oper",
+                "whois_idle_signon",
+                "whois_channels",
+                "whois_certfp",
+                "whois_keyvalue",
+                "whois_away",
+                "end_of_whois"
+            ]
+        );
+    }
+
+    #[test]
+    fn whois_raw_account_and_secure_are_themeable() {
+        let mut state = make_test_state();
+        state.set_active_buffer("test/testserver");
+
+        for command in [
+            Command::Raw(
+                "330".to_string(),
+                vec![
+                    "me".to_string(),
+                    "alice".to_string(),
+                    "alice_account".to_string(),
+                    "is logged in as".to_string(),
+                ],
+            ),
+            Command::Raw(
+                "671".to_string(),
+                vec![
+                    "me".to_string(),
+                    "alice".to_string(),
+                    "is using a secure connection".to_string(),
+                ],
+            ),
+        ] {
+            let msg = make_irc_msg(None, command);
+            handle_irc_message(&mut state, "test", &msg);
+        }
+
+        let buf = state.buffers.get("test/testserver").unwrap();
+
+        assert_eq!(buf.messages[0].event_key.as_deref(), Some("whois_account"));
+        assert_eq!(buf.messages[1].event_key.as_deref(), Some("whois_secure"));
+        assert_eq!(
+            buf.messages[1].event_params.as_deref(),
+            Some(
+                &[
+                    "alice".to_string(),
+                    "TLS".to_string(),
+                    "is using a secure connection".to_string(),
+                ][..]
+            )
+        );
+    }
+
+    #[test]
+    fn whois_idle_without_signon_uses_idle_theme_key() {
+        let mut state = make_test_state();
+        state.set_active_buffer("test/testserver");
+
+        let msg = make_irc_msg(
+            None,
+            Command::Response(
+                Response::RPL_WHOISIDLE,
+                vec!["me".to_string(), "alice".to_string(), "65".to_string()],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/testserver").unwrap();
+
+        assert_eq!(buf.messages[0].event_key.as_deref(), Some("whois_idle"));
+    }
+
+    #[test]
+    fn banlist_response_upserts_cached_ban_entry() {
+        let mut state = make_test_state();
+        state.set_active_buffer("test/testserver");
+
+        for (set_by, timestamp) in [("alice", "1700000000"), ("bob", "1700000100")] {
+            let msg = make_irc_msg(
+                None,
+                Command::Response(
+                    Response::RPL_BANLIST,
+                    vec![
+                        "me".to_string(),
+                        "#test".to_string(),
+                        "*!*@bad.example".to_string(),
+                        set_by.to_string(),
+                        timestamp.to_string(),
+                    ],
+                ),
+            );
+            handle_irc_message(&mut state, "test", &msg);
+        }
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        let bans = buf.list_modes.get(BAN_MODE_KEY).unwrap();
+        assert_eq!(bans.len(), 1);
+        assert_eq!(bans[0].set_by, "bob");
+        assert_eq!(bans[0].set_at, 1_700_000_100);
+    }
+
+    #[test]
+    fn silent_banlist_sync_updates_state_without_display() {
+        let mut state = make_test_state();
+        state.set_active_buffer("test/testserver");
+        if let Some(conn) = state.connections.get_mut("test") {
+            conn.silent_banlist_channels.insert("#test".to_string());
+        }
+
+        let list_msg = make_irc_msg(
+            None,
+            Command::Response(
+                Response::RPL_BANLIST,
+                vec![
+                    "me".to_string(),
+                    "#test".to_string(),
+                    "*!*@bad.example".to_string(),
+                    "oper".to_string(),
+                    "1700000000".to_string(),
+                ],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &list_msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert_eq!(buf.list_modes.get(BAN_MODE_KEY).unwrap().len(), 1);
+        assert!(
+            state
+                .buffers
+                .get("test/testserver")
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+
+        let end_msg = make_irc_msg(
+            None,
+            Command::Response(
+                Response::RPL_ENDOFBANLIST,
+                vec![
+                    "me".to_string(),
+                    "#test".to_string(),
+                    "End of channel ban list".to_string(),
+                ],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &end_msg);
+
+        let conn = state.connections.get("test").unwrap();
+        assert!(!conn.silent_banlist_channels.contains("#test"));
+        assert!(
+            state
+                .buffers
+                .get("test/testserver")
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn silent_banlist_sync_suppresses_case_variant_channel() {
+        let mut state = make_test_state();
+        state.set_active_buffer("test/testserver");
+        if let Some(conn) = state.connections.get_mut("test") {
+            conn.silent_banlist_channels.insert("#Test".to_string());
+        }
+
+        let list_msg = make_irc_msg(
+            None,
+            Command::Response(
+                Response::RPL_BANLIST,
+                vec![
+                    "me".to_string(),
+                    "#test".to_string(),
+                    "*!*@bad.example".to_string(),
+                    "oper".to_string(),
+                    "1700000000".to_string(),
+                ],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &list_msg);
+
+        let buf = state.buffers.get("test/#test").unwrap();
+        assert_eq!(buf.list_modes.get(BAN_MODE_KEY).unwrap().len(), 1);
+        assert!(
+            state
+                .buffers
+                .get("test/testserver")
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+
+        let end_msg = make_irc_msg(
+            None,
+            Command::Response(
+                Response::RPL_ENDOFBANLIST,
+                vec![
+                    "me".to_string(),
+                    "#TEST".to_string(),
+                    "End of channel ban list".to_string(),
+                ],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &end_msg);
+
+        let conn = state.connections.get("test").unwrap();
+        assert!(conn.silent_banlist_channels.is_empty());
+        assert!(
+            state
+                .buffers
+                .get("test/testserver")
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn silent_mode_sync_suppresses_channel_creation_notice() {
+        let mut state = make_test_state();
+        state.set_active_buffer("test/testserver");
+        if let Some(conn) = state.connections.get_mut("test") {
+            conn.silent_banlist_channels.insert("#Test".to_string());
+        }
+
+        let msg = make_irc_msg(
+            None,
+            Command::Raw(
+                "329".to_string(),
+                vec![
+                    "me".to_string(),
+                    "#test".to_string(),
+                    "1700000000".to_string(),
+                ],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let channel_buf = state.buffers.get("test/#test").unwrap();
+        assert!(channel_buf.messages.is_empty());
+    }
+
+    #[test]
+    fn next_who_token_increments() {
+        let mut state = make_test_state();
+        let t1 = next_who_token(&mut state, "test");
+        let t2 = next_who_token(&mut state, "test");
+        let t3 = next_who_token(&mut state, "test");
+        assert_eq!(t1, "1");
+        assert_eq!(t2, "2");
+        assert_eq!(t3, "3");
+    }
+
+    #[test]
+    fn build_whox_who_returns_none_without_whox() {
+        let mut state = make_test_state();
+        // WHOX not enabled by default
+        assert!(build_whox_who(&mut state, "test", "#test", false).is_none());
+    }
+
+    #[test]
+    fn build_whox_who_returns_fields_with_whox() {
+        let mut state = make_whox_state();
+        let result = build_whox_who(&mut state, "test", "#test", false);
+        assert!(result.is_some());
+        let (target, fields) = result.unwrap();
+        assert_eq!(target, "#test");
+        assert!(fields.starts_with("%tcuihnfar,"));
+        // Token should be "1" (first call)
+        assert!(fields.ends_with(",1"));
+    }
+
+    #[test]
+    fn build_whox_who_silent_registers_channel() {
+        let mut state = make_whox_state();
+        let result = build_whox_who(&mut state, "test", "#silent", true);
+        assert!(result.is_some());
+        let conn = state.connections.get("test").unwrap();
+        assert!(conn.silent_who_channels.contains("#silent"));
+    }
+
+    #[test]
+    fn build_whox_who_non_silent_does_not_register() {
+        let mut state = make_whox_state();
+        let _result = build_whox_who(&mut state, "test", "#loud", false);
+        let conn = state.connections.get("test").unwrap();
+        assert!(!conn.silent_who_channels.contains("#loud"));
+    }
+
+    #[test]
+    fn silent_whox_reply_updates_state_without_display() {
+        let mut state = make_whox_state();
+        state.set_active_buffer("test/testserver");
+
+        // Register #test as silent auto-WHO
+        if let Some(conn) = state.connections.get_mut("test") {
+            conn.silent_who_channels.insert("#test".to_string());
+        }
+
+        let msg = make_irc_msg(
+            None,
+            Command::Raw(
+                "354".to_string(),
+                vec![
+                    "me".to_string(),
+                    "1".to_string(),
+                    "#test".to_string(),
+                    "~alice".to_string(),
+                    "1.2.3.4".to_string(),
+                    "host.example.com".to_string(),
+                    "alice".to_string(),
+                    "H".to_string(),
+                    "alice_acct".to_string(),
+                    "Alice Smith".to_string(),
+                ],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        // State updated
+        let buf = state.buffers.get("test/#test").unwrap();
+        let entry = buf.users.get("alice").unwrap();
+        assert_eq!(entry.ident.as_deref(), Some("~alice"));
+        assert_eq!(entry.account.as_deref(), Some("alice_acct"));
+
+        // No display output — server buffer should be empty
+        let server_buf = state.buffers.get("test/testserver").unwrap();
+        assert!(server_buf.messages.is_empty());
+    }
+
+    #[test]
+    fn silent_whox_reply_suppresses_case_variant_channel() {
+        let mut state = make_whox_state();
+        state.set_active_buffer("test/testserver");
+
+        if let Some(conn) = state.connections.get_mut("test") {
+            conn.silent_who_channels.insert("#Test".to_string());
+        }
+
+        let msg = make_irc_msg(
+            None,
+            Command::Raw(
+                "354".to_string(),
+                vec![
+                    "me".to_string(),
+                    "1".to_string(),
+                    "#test".to_string(),
+                    "~alice".to_string(),
+                    "1.2.3.4".to_string(),
+                    "host.example.com".to_string(),
+                    "alice".to_string(),
+                    "H".to_string(),
+                    "alice_acct".to_string(),
+                    "Alice Smith".to_string(),
+                ],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let server_buf = state.buffers.get("test/testserver").unwrap();
+        assert!(server_buf.messages.is_empty());
+    }
+
+    #[test]
+    fn silent_who_end_cleans_up_and_suppresses_display() {
+        let mut state = make_whox_state();
+        state.set_active_buffer("test/testserver");
+
+        // Register #test as silent auto-WHO
+        if let Some(conn) = state.connections.get_mut("test") {
+            conn.silent_who_channels.insert("#test".to_string());
+        }
+
+        let msg = make_irc_msg(
+            None,
+            Command::Response(
+                Response::RPL_ENDOFWHO,
+                vec![
+                    "me".to_string(),
+                    "#test".to_string(),
+                    "End of WHO list".to_string(),
+                ],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        // Silent channel removed
+        let conn = state.connections.get("test").unwrap();
+        assert!(!conn.silent_who_channels.contains("#test"));
+
+        // No display output
+        let server_buf = state.buffers.get("test/testserver").unwrap();
+        assert!(server_buf.messages.is_empty());
+    }
+
+    #[test]
+    fn silent_who_end_cleans_up_case_variant_channel() {
+        let mut state = make_whox_state();
+        state.set_active_buffer("test/testserver");
+
+        if let Some(conn) = state.connections.get_mut("test") {
+            conn.silent_who_channels.insert("#Test".to_string());
+        }
+
+        let msg = make_irc_msg(
+            None,
+            Command::Response(
+                Response::RPL_ENDOFWHO,
+                vec![
+                    "me".to_string(),
+                    "#TEST".to_string(),
+                    "End of WHO list".to_string(),
+                ],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let conn = state.connections.get("test").unwrap();
+        assert!(conn.silent_who_channels.is_empty());
+
+        let server_buf = state.buffers.get("test/testserver").unwrap();
+        assert!(server_buf.messages.is_empty());
+    }
+
+    #[test]
+    fn stale_cleanup_contract_silent_flags_suppress_late_replies() {
+        // Regression for the autoconnect leak on Solanum: the 30s stale-batch
+        // cleanup in App::check_stale_who_batches drops `channel_query_in_flight`
+        // and `channel_query_sent_at` so the next WHO batch can start, but it
+        // MUST leave `silent_who_channels` and `silent_banlist_channels`
+        // populated. Solanum rate-limits RPL_WHOSPCRPL on large channels so
+        // the corresponding RPL_ENDOFWHO / RPL_BANLIST / RPL_ENDOFBANLIST can
+        // arrive past the cleanup window — if the silent flags were stripped
+        // alongside the in-flight tracking they would leak to the active
+        // buffer ("End of WHO list" / ban entries / "End of ban list").
+        //
+        // This test exercises the exact post-cleanup state at the AppState
+        // layer (in_flight lives on App and is irrelevant to suppression —
+        // only the silent flags gate the reply handlers).
+        let mut state = make_whox_state();
+        state.set_active_buffer("test/testserver");
+        if let Some(conn) = state.connections.get_mut("test") {
+            conn.silent_who_channels.insert("#big".to_string());
+            conn.silent_banlist_channels.insert("#big".to_string());
+        }
+
+        let endwho = make_irc_msg(
+            None,
+            Command::Response(
+                Response::RPL_ENDOFWHO,
+                vec!["me".into(), "#big".into(), "End of WHO list".into()],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &endwho);
+
+        let banlist = make_irc_msg(
+            None,
+            Command::Response(
+                Response::RPL_BANLIST,
+                vec![
+                    "me".into(),
+                    "#big".into(),
+                    "*!*@spammer.example".into(),
+                    "oper".into(),
+                    "1700000000".into(),
+                ],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &banlist);
+
+        let endban = make_irc_msg(
+            None,
+            Command::Response(
+                Response::RPL_ENDOFBANLIST,
+                vec!["me".into(), "#big".into(), "End of channel ban list".into()],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &endban);
+
+        let server_buf = state.buffers.get("test/testserver").unwrap();
+        assert!(
+            server_buf.messages.is_empty(),
+            "late WHO/banlist replies must stay suppressed after stale cleanup"
+        );
+    }
+
+    #[test]
+    fn manual_who_end_displays_message() {
+        let mut state = make_whox_state();
+        state.set_active_buffer("test/testserver");
+
+        // No silent channels registered — this is a manual /who
+        let msg = make_irc_msg(
+            None,
+            Command::Response(
+                Response::RPL_ENDOFWHO,
+                vec![
+                    "me".to_string(),
+                    "#test".to_string(),
+                    "End of WHO list".to_string(),
+                ],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let server_buf = state.buffers.get("test/testserver").unwrap();
+        assert_eq!(server_buf.messages.len(), 1);
+        assert!(server_buf.messages[0].text.contains("End of WHO list"));
+    }
+
+    // === ERROR handler tests ===
+
+    #[test]
+    fn error_command_creates_event_in_status_buffer() {
+        let mut state = make_test_state();
+        let msg = make_irc_msg(
+            Some("irc.server.com"),
+            Command::ERROR("Closing Link: timeout".into()),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get("test/testserver").unwrap();
+        assert_eq!(buf.messages.len(), 1);
+        assert!(buf.messages[0].text.contains("ERROR"));
+        assert!(buf.messages[0].text.contains("Closing Link: timeout"));
+        assert_eq!(buf.messages[0].message_type, MessageType::Event);
+    }
+
+    #[test]
+    fn error_command_marks_connection_as_errored() {
+        let mut state = make_test_state();
+        let msg = make_irc_msg(Some("irc.server.com"), Command::ERROR("Banned".into()));
+        handle_irc_message(&mut state, "test", &msg);
+
+        let conn = state.connections.get("test").unwrap();
+        assert_eq!(conn.status, ConnectionStatus::Error);
+        assert_eq!(conn.error.as_deref(), Some("Banned"));
+    }
+
+    // === Join failure: eager buffer cleanup ===
+
+    #[test]
+    fn join_failure_removes_empty_buffer() {
+        let mut state = make_test_state();
+        // Pre-create a channel buffer (erssi-style eager creation).
+        state.add_buffer(make_channel_buffer("test", "#locked"));
+        assert!(state.buffers.contains_key("test/#locked"));
+
+        // Server responds with 474 ERR_BANNEDFROMCHAN.
+        let msg = make_irc_msg(
+            None,
+            Command::Response(
+                Response::ERR_BANNEDFROMCHAN,
+                vec![
+                    "me".into(),
+                    "#locked".into(),
+                    "Cannot join channel (+b)".into(),
+                ],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        // Buffer should be destroyed since it had no users.
+        assert!(!state.buffers.contains_key("test/#locked"));
+    }
+
+    #[test]
+    fn join_failure_keeps_active_buffer() {
+        let mut state = make_test_state();
+        // Pre-create buffer AND add a user (simulating a successful prior join).
+        state.add_buffer(make_channel_buffer("test", "#active"));
+        state.add_nick(
+            "test/#active",
+            NickEntry {
+                nick: "me".into(),
+                prefix: String::new(),
+                modes: String::new(),
+                away: false,
+                account: None,
+                ident: None,
+                host: None,
+            },
+        );
+
+        let msg = make_irc_msg(
+            None,
+            Command::Response(
+                Response::ERR_BANNEDFROMCHAN,
+                vec![
+                    "me".into(),
+                    "#active".into(),
+                    "Cannot join channel (+b)".into(),
+                ],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        // Buffer should NOT be destroyed — it has users.
+        assert!(state.buffers.contains_key("test/#active"));
+    }
+
+    #[test]
+    fn join_failure_invite_only() {
+        let mut state = make_test_state();
+        state.add_buffer(make_channel_buffer("test", "#secret"));
+
+        let msg = make_irc_msg(
+            None,
+            Command::Response(
+                Response::ERR_INVITEONLYCHAN,
+                vec![
+                    "me".into(),
+                    "#secret".into(),
+                    "Cannot join channel (+i)".into(),
+                ],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        assert!(!state.buffers.contains_key("test/#secret"));
+    }
+
+    #[test]
+    fn join_failure_channel_full() {
+        let mut state = make_test_state();
+        state.add_buffer(make_channel_buffer("test", "#crowded"));
+
+        let msg = make_irc_msg(
+            None,
+            Command::Response(
+                Response::ERR_CHANNELISFULL,
+                vec![
+                    "me".into(),
+                    "#crowded".into(),
+                    "Cannot join channel (+l)".into(),
+                ],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        assert!(!state.buffers.contains_key("test/#crowded"));
+    }
+
+    #[test]
+    fn join_failure_bad_key() {
+        let mut state = make_test_state();
+        state.add_buffer(make_channel_buffer("test", "#keyed"));
+
+        let msg = make_irc_msg(
+            None,
+            Command::Response(
+                Response::ERR_BADCHANNELKEY,
+                vec![
+                    "me".into(),
+                    "#keyed".into(),
+                    "Cannot join channel (+k)".into(),
+                ],
+            ),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        assert!(!state.buffers.contains_key("test/#keyed"));
+    }
+
+    // === Disconnect / rejoin nicklist lifecycle ===
+
+    #[test]
+    fn disconnect_wipes_channel_nicklists_for_connection() {
+        let mut state = make_test_state();
+        let chan_id = make_buffer_id("test", "#test");
+        state.add_nick(
+            &chan_id,
+            NickEntry {
+                nick: "alice".into(),
+                prefix: String::new(),
+                modes: String::new(),
+                away: false,
+                account: None,
+                ident: None,
+                host: None,
+            },
+        );
+        state
+            .buffers
+            .get_mut(&chan_id)
+            .unwrap()
+            .last_speakers
+            .push("alice".into());
+
+        handle_disconnected(&mut state, "test", None);
+
+        let buf = state.buffers.get(&chan_id).unwrap();
+        assert!(buf.users.is_empty(), "users should be wiped on disconnect");
+        assert!(buf.last_speakers.is_empty());
+        // Channel name still recorded for rejoin
+        let conn = state.connections.get("test").unwrap();
+        assert!(conn.joined_channels.iter().any(|c| c == "#test"));
+    }
+
+    #[test]
+    fn disconnect_does_not_touch_other_connections() {
+        let mut state = make_test_state();
+        // Second connection with its own channel
+        state.add_connection(Connection {
+            id: "other".into(),
+            label: "Other".into(),
+            status: ConnectionStatus::Connected,
+            nick: "me".into(),
+            user_modes: String::new(),
+            isupport: HashMap::new(),
+            isupport_parsed: crate::irc::isupport::Isupport::new(),
+            error: None,
+            lag: None,
+            lag_pending: false,
+            reconnect_attempts: 0,
+            reconnect_delay_secs: 30,
+            next_reconnect: None,
+            should_reconnect: true,
+            joined_channels: Vec::new(),
+            origin_config: state.connections.get("test").unwrap().origin_config.clone(),
+            local_ip: None,
+            enabled_caps: std::collections::HashSet::new(),
+            who_token_counter: 0,
+            silent_who_channels: std::collections::HashSet::new(),
+            silent_banlist_channels: std::collections::HashSet::new(),
+        });
+        let other_chan = make_buffer_id("other", "#other");
+        state.add_buffer(make_channel_buffer("other", "#other"));
+        state.add_nick(
+            &other_chan,
+            NickEntry {
+                nick: "bob".into(),
+                prefix: String::new(),
+                modes: String::new(),
+                away: false,
+                account: None,
+                ident: None,
+                host: None,
+            },
+        );
+
+        handle_disconnected(&mut state, "test", None);
+
+        // "other" connection's nicklist must not be wiped
+        assert_eq!(state.buffers.get(&other_chan).unwrap().users.len(), 1);
+    }
+
+    #[test]
+    fn self_join_to_existing_buffer_with_users_is_ignored() {
+        // Defense against ZNC bouncer replays / stray double-JOINs: if the
+        // nicklist is already populated, treat the JOIN as a duplicate.
+        let mut state = make_test_state();
+        let chan_id = make_buffer_id("test", "#test");
+        // Pre-populate with a stale message we expect NOT to repeat.
+        let initial_msgs = state.buffers.get(&chan_id).unwrap().messages.len();
+
+        let msg = make_irc_msg(
+            Some("me!ident@host"),
+            Command::JOIN("#test".into(), None, None),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get(&chan_id).unwrap();
+        // No new join message added (we returned early).
+        assert_eq!(buf.messages.len(), initial_msgs);
+        // Existing nicks preserved.
+        assert!(buf.users.contains_key("me"));
+    }
+
+    #[test]
+    fn self_join_to_empty_existing_buffer_resets_stale_state() {
+        // After disconnect → reconnect rejoin: buffer exists but users were
+        // wiped by handle_disconnected. The JOIN must reset stale topic/modes
+        // so the fresh RPL_TOPIC / RPL_CHANNELMODEIS rebuild from scratch.
+        let mut state = make_test_state();
+        let chan_id = make_buffer_id("test", "#test");
+        {
+            let buf = state.buffers.get_mut(&chan_id).unwrap();
+            buf.users.clear();
+            buf.topic = Some("stale topic".into());
+            buf.topic_set_by = Some("stale_setter".into());
+            buf.modes = Some("nt".into());
+            buf.list_modes.insert("b".into(), vec![]);
+        }
+
+        let msg = make_irc_msg(
+            Some("me!ident@host"),
+            Command::JOIN("#test".into(), None, None),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        let buf = state.buffers.get(&chan_id).unwrap();
+        assert!(buf.topic.is_none(), "topic should be cleared on rejoin");
+        assert!(buf.topic_set_by.is_none());
+        assert!(buf.modes.is_none());
+        assert!(buf.list_modes.is_empty());
+    }
+
+    #[test]
+    fn self_join_creates_buffer_when_missing() {
+        let mut state = make_test_state();
+        let chan_id = make_buffer_id("test", "#fresh");
+        assert!(!state.buffers.contains_key(&chan_id));
+
+        let msg = make_irc_msg(
+            Some("me!ident@host"),
+            Command::JOIN("#fresh".into(), None, None),
+        );
+        handle_irc_message(&mut state, "test", &msg);
+
+        assert!(state.buffers.contains_key(&chan_id));
+        assert_eq!(state.active_buffer_id.as_deref(), Some(chan_id.as_str()));
+    }
+}

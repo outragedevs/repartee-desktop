@@ -1,0 +1,1721 @@
+#![allow(clippy::redundant_pub_crate)]
+
+use super::helpers::add_local_event;
+use super::types::{C_CMD, C_DIM, C_ERR, C_OK, C_RST, C_TEXT, divider};
+use crate::app::App;
+use crate::storage;
+
+// === Configuration ===
+
+const SERVER_ADD_USAGE: &str = "Usage: /server add <id> <address>[:<port>] [port] [-tls] [-notls] [-tlsverify] [-notlsverify] [-auto] [-noauto] [-label=<name>] [-nick=<nick>] [-username=<user>] [-realname=<name>] [-password=<pass>] [-sasl=<user>:<pass>] [-sasl-user=<user>] [-sasl-pass=<pass>] [-sasl-mechanism=<mechanism>] [-channels=<ch1,ch2>] [-bind=<ip>] [-encoding=<codec>] [-autoreconnect=<bool>] [-reconnect-delay=<secs>] [-reconnect-max-retries=<n>] [-autosendcmd=<cmds>] [-client-cert=<path>]";
+
+/// How a credential should be persisted to `.env`.
+#[derive(Debug, Clone)]
+pub(crate) enum CredUpdate {
+    /// Leave the existing credential untouched: preserve whatever is already
+    /// stored for this server id (edit mode, or a manual re-add that omits the
+    /// flag). Neither `.env` nor the in-memory value is changed.
+    Keep,
+    /// Write this value to `.env`.
+    Set(String),
+    /// Delete the key from `.env`.
+    Remove,
+}
+
+/// Insert/overwrite a server in `config.servers`, persist `config.toml`, and route
+/// the server password + SASL password to `.env` (never `config.toml`). Mutates the
+/// in-memory `ServerConfig` so it carries the resolved credentials too.
+///
+/// `id` must already be lowercased. Shared by manual `/server add`, the TUI wizard,
+/// and the web `SaveServer` command.
+///
+/// `CredUpdate::Keep` preserves the credential already stored for `id` in
+/// `config.servers` (the single source of truth for the running session), so a
+/// re-add/edit that omits a password never silently drops it. `config.toml` is
+/// saved *before* `.env` is touched, so a save failure can never leave an
+/// orphaned secret in `.env` for a server that isn't persisted.
+///
+/// # Errors
+/// Propagates I/O errors from writing `config.toml` or `.env`.
+pub(crate) fn apply_server_config(
+    config: &mut crate::config::AppConfig,
+    config_path: &std::path::Path,
+    env_path: &std::path::Path,
+    id: &str,
+    mut server: crate::config::ServerConfig,
+    password: CredUpdate,
+    sasl_pass: CredUpdate,
+) -> color_eyre::eyre::Result<()> {
+    let upper = id.to_uppercase();
+    let pw_key = format!("{upper}_PASSWORD");
+    let sasl_key = format!("{upper}_SASL_PASS");
+
+    // Resolve the in-memory credential values (Keep reads the existing entry).
+    let existing_pw = config.servers.get(id).and_then(|s| s.password.clone());
+    let existing_sasl = config.servers.get(id).and_then(|s| s.sasl_pass.clone());
+    server.password = match &password {
+        CredUpdate::Set(v) => Some(v.clone()),
+        CredUpdate::Remove => None,
+        CredUpdate::Keep => existing_pw,
+    };
+    server.sasl_pass = match &sasl_pass {
+        CredUpdate::Set(v) => Some(v.clone()),
+        CredUpdate::Remove => None,
+        CredUpdate::Keep => existing_sasl,
+    };
+
+    // Persist the non-secret config first: a failure here must not leave secrets
+    // in `.env` for a server that never made it into config.toml.
+    config.servers.insert(id.to_string(), server);
+    crate::config::save_config(config_path, config)?;
+
+    // Then route secrets to `.env`.
+    match password {
+        CredUpdate::Set(v) => crate::config::env::set_env_value(env_path, &pw_key, &v)?,
+        CredUpdate::Remove => crate::config::env::remove_env_value(env_path, &pw_key)?,
+        CredUpdate::Keep => {}
+    }
+    match sasl_pass {
+        CredUpdate::Set(v) => crate::config::env::set_env_value(env_path, &sasl_key, &v)?,
+        CredUpdate::Remove => crate::config::env::remove_env_value(env_path, &sasl_key)?,
+        CredUpdate::Keep => {}
+    }
+    Ok(())
+}
+
+/// Map a manual `/server add` flag value to a [`CredUpdate`]: absent flag keeps
+/// any existing credential, `-password=` (explicit empty) clears it, and a
+/// non-empty value sets it.
+fn manual_cred(value: Option<String>) -> CredUpdate {
+    match value {
+        None => CredUpdate::Keep,
+        Some(s) if s.is_empty() => CredUpdate::Remove,
+        Some(s) => CredUpdate::Set(s),
+    }
+}
+
+pub(crate) fn cmd_reload(app: &mut App, _args: &[String]) {
+    // Snapshot the pre-reload shrink api_key state so we can detect
+    // a transition from empty → populated and tell the user that
+    // the workers were not spawned at startup and a restart is
+    // required to activate them. (The ShrinkRuntime — client and
+    // worker tasks — is constructed once in App::new_with_mode and
+    // cannot be safely rebuilt from a command handler because the
+    // deliver receiver is owned by the main tokio::select! loop.)
+    let shrink_was_inactive = app.shrink_client.is_none();
+
+    // Reload config.toml
+    match crate::config::load_config(&crate::constants::config_path()) {
+        Ok(new_config) => {
+            app.config = new_config;
+            app.cached_config_toml = None;
+            // A reload swaps out config.servers wholesale; an open edit-wizard
+            // captured the old map and would resolve "keep" credentials against
+            // a stale/absent entry on save, so close it.
+            app.wizard = None;
+            // Sync derived state from new config
+            app.state.scrollback_limit = app.config.display.scrollback_lines;
+            app.state.flood_protection = app.config.general.flood_protection;
+            app.state
+                .flood_exemptions
+                .clone_from(&app.config.general.flood_exemptions);
+            app.state.ignores.clone_from(&app.config.ignores);
+            app.state.nick_color_sat = app.config.display.nick_color_saturation;
+            app.state.nick_color_lit = app.config.display.nick_color_lightness;
+            add_local_event(app, &format!("{C_OK}Config reloaded{C_RST}"));
+        }
+        Err(e) => {
+            add_local_event(app, &format!("{C_ERR}Failed to reload config: {e}{C_RST}"));
+            return;
+        }
+    }
+
+    // Re-read .env and re-apply every credential layer (server
+    // passwords / SASL, web session secret, SHRINK_API_KEY). Without
+    // this step, keys added or rotated in ~/.repartee/.env after
+    // startup stay invisible until the user quits and restarts.
+    // Existing connections keep their already-negotiated credentials;
+    // new /connect attempts (and any code path that re-reads
+    // app.config) pick up the new values.
+    match crate::config::load_env(&crate::constants::env_path()) {
+        Ok(env_vars) => {
+            crate::config::apply_credentials(&mut app.config.servers, &env_vars);
+            crate::config::apply_web_credentials(&mut app.config.web, &env_vars);
+            crate::config::apply_shrink_credentials(&mut app.config.shrink, &env_vars);
+            add_local_event(app, &format!("{C_OK}.env reloaded{C_RST}"));
+
+            // Surface the shrink restart-required edge case: the API
+            // key just appeared in .env but the runtime was built
+            // empty-keyed at startup, so the workers are not running
+            // and the in-process /shrink path stays a no-op until a
+            // full restart. Explicit message beats silent failure.
+            if shrink_was_inactive && !app.config.shrink.api_key.is_empty() {
+                add_local_event(
+                    app,
+                    &format!(
+                        "{C_OK}SHRINK_API_KEY picked up from .env — \
+                         restart repartee to activate the shrink workers{C_RST}"
+                    ),
+                );
+            }
+        }
+        Err(e) => {
+            add_local_event(app, &format!("{C_ERR}Failed to reload .env: {e}{C_RST}"));
+        }
+    }
+
+    // Reload theme
+    let theme_path =
+        crate::constants::theme_dir().join(format!("{}.theme", app.config.general.theme));
+    match crate::theme::load_theme(&theme_path) {
+        Ok(new_theme) => {
+            app.theme = new_theme;
+            add_local_event(app, &format!("{C_OK}Theme reloaded{C_RST}"));
+        }
+        Err(e) => {
+            add_local_event(app, &format!("{C_ERR}Failed to reload theme: {e}{C_RST}"));
+        }
+    }
+
+    // Recompute cached wrap-indent (depends on config + theme).
+    app.recompute_wrap_indent();
+}
+
+pub(crate) fn cmd_flood(app: &mut App, args: &[String]) {
+    let Some(subcmd) = args.first().map(String::as_str) else {
+        list_flood_settings(app);
+        return;
+    };
+
+    if subcmd.eq_ignore_ascii_case("list") {
+        list_flood_settings(app);
+        return;
+    }
+
+    if subcmd.eq_ignore_ascii_case("on") || subcmd.eq_ignore_ascii_case("enable") {
+        app.config.general.flood_protection = true;
+        app.state.flood_protection = true;
+        save_flood_settings(app);
+        add_local_event(app, &format!("{C_OK}Flood protection enabled{C_RST}"));
+        return;
+    }
+
+    if subcmd.eq_ignore_ascii_case("off") || subcmd.eq_ignore_ascii_case("disable") {
+        app.config.general.flood_protection = false;
+        app.state.flood_protection = false;
+        save_flood_settings(app);
+        add_local_event(app, &format!("{C_OK}Flood protection disabled{C_RST}"));
+        return;
+    }
+
+    if subcmd_is(subcmd, &["add", "except", "exempt", "allow", "trust"]) {
+        let Some(mask) = args.get(1) else {
+            add_local_event(app, "Usage: /flood add <nick|mask>");
+            return;
+        };
+        if app
+            .config
+            .general
+            .flood_exemptions
+            .iter()
+            .any(|entry| entry.eq_ignore_ascii_case(mask))
+        {
+            add_local_event(
+                app,
+                &format!("{C_DIM}Flood exemption already exists: {mask}{C_RST}"),
+            );
+            return;
+        }
+        app.config.general.flood_exemptions.push(mask.clone());
+        app.state
+            .flood_exemptions
+            .clone_from(&app.config.general.flood_exemptions);
+        save_flood_settings(app);
+        add_local_event(app, &format!("{C_OK}Added flood exemption: {mask}{C_RST}"));
+        return;
+    }
+
+    if subcmd_is(
+        subcmd,
+        &["remove", "rm", "del", "delete", "unexcept", "unexempt"],
+    ) {
+        let Some(target) = args.get(1) else {
+            add_local_event(app, "Usage: /flood remove <number|mask>");
+            return;
+        };
+        remove_flood_exemption(app, target);
+        return;
+    }
+
+    add_local_event(
+        app,
+        "Usage: /flood [list|on|off|add <nick|mask>|remove <number|mask>]",
+    );
+}
+
+fn list_flood_settings(app: &mut App) {
+    let mut lines = vec![divider("Flood Protection")];
+    let status = if app.config.general.flood_protection {
+        format!("{C_OK}enabled{C_RST}")
+    } else {
+        format!("{C_ERR}disabled{C_RST}")
+    };
+    lines.push(format!("  status: {status}"));
+    if app.config.general.flood_exemptions.is_empty() {
+        lines.push(format!("  {C_DIM}No PRIVMSG exemptions configured{C_RST}"));
+    } else {
+        for (i, mask) in app.config.general.flood_exemptions.iter().enumerate() {
+            lines.push(format!("  {C_CMD}{}. {}{C_RST}", i + 1, mask));
+        }
+    }
+    lines.push(divider(""));
+    for line in &lines {
+        add_local_event(app, line);
+    }
+}
+
+fn remove_flood_exemption(app: &mut App, target: &str) {
+    let removed = if let Ok(n) = target.parse::<usize>()
+        && n >= 1
+        && n <= app.config.general.flood_exemptions.len()
+    {
+        Some(app.config.general.flood_exemptions.remove(n - 1))
+    } else {
+        app.config
+            .general
+            .flood_exemptions
+            .iter()
+            .position(|entry| entry.eq_ignore_ascii_case(target))
+            .map(|pos| app.config.general.flood_exemptions.remove(pos))
+    };
+
+    if let Some(mask) = removed {
+        app.state
+            .flood_exemptions
+            .clone_from(&app.config.general.flood_exemptions);
+        save_flood_settings(app);
+        add_local_event(
+            app,
+            &format!("{C_OK}Removed flood exemption: {mask}{C_RST}"),
+        );
+    } else {
+        add_local_event(
+            app,
+            &format!("{C_ERR}No flood exemption matching: {target}{C_RST}"),
+        );
+    }
+}
+
+fn save_flood_settings(app: &mut App) {
+    app.cached_config_toml = None;
+    let _ = crate::config::save_config(&crate::constants::config_path(), &app.config);
+}
+
+fn subcmd_is(subcmd: &str, choices: &[&str]) -> bool {
+    choices
+        .iter()
+        .any(|choice| subcmd.eq_ignore_ascii_case(choice))
+}
+
+pub(crate) fn cmd_ignore(app: &mut App, args: &[String]) {
+    if args.is_empty() {
+        // List ignore rules — collect lines first to avoid borrow issues
+        let mut lines = vec![divider("Ignore List")];
+        if app.config.ignores.is_empty() {
+            lines.push(format!("  {C_DIM}No ignore rules configured{C_RST}"));
+        } else {
+            for (i, entry) in app.config.ignores.iter().enumerate() {
+                let level_str = if entry.levels.is_empty() {
+                    "ALL".to_string()
+                } else {
+                    entry
+                        .levels
+                        .iter()
+                        .map(|l| format!("{l:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let chan_str = entry
+                    .channels
+                    .as_ref()
+                    .map(|chs| format!(" channels:{}", chs.join(",")))
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "  {C_CMD}{}. {}{C_RST} {C_DIM}[{level_str}]{chan_str}{C_RST}",
+                    i + 1,
+                    entry.mask
+                ));
+            }
+        }
+        lines.push(divider(""));
+        for line in &lines {
+            add_local_event(app, line);
+        }
+        return;
+    }
+
+    let mask = args[0].clone();
+    let mut levels: Vec<crate::config::IgnoreLevel> = Vec::new();
+    let mut channels: Option<Vec<String>> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "-channels" || args[i] == "-channel" {
+            if i + 1 < args.len() {
+                i += 1;
+                channels = Some(
+                    args[i]
+                        .split(',')
+                        .map(|s| s.trim().to_lowercase())
+                        .collect(),
+                );
+            }
+        } else if let Some(level) = parse_ignore_level(&args[i]) {
+            levels.push(level);
+        }
+        i += 1;
+    }
+
+    app.config.ignores.push(crate::config::IgnoreEntry {
+        mask: mask.clone(),
+        levels,
+        channels,
+    });
+
+    // Save config
+    app.cached_config_toml = None;
+    let _ = crate::config::save_config(&crate::constants::config_path(), &app.config);
+    add_local_event(app, &format!("{C_OK}Added ignore rule: {mask}{C_RST}"));
+}
+
+pub(crate) fn cmd_unignore(app: &mut App, args: &[String]) {
+    if args.is_empty() {
+        add_local_event(app, "Usage: /unignore <number|mask>");
+        return;
+    }
+
+    let target = &args[0];
+
+    // Try as number first
+    if let Ok(n) = target.parse::<usize>()
+        && n >= 1
+        && n <= app.config.ignores.len()
+    {
+        let removed = app.config.ignores.remove(n - 1);
+        app.cached_config_toml = None;
+        let _ = crate::config::save_config(&crate::constants::config_path(), &app.config);
+        add_local_event(
+            app,
+            &format!("{C_OK}Removed ignore rule: {}{C_RST}", removed.mask),
+        );
+        return;
+    }
+
+    // Try as mask
+    if let Some(pos) = app.config.ignores.iter().position(|e| e.mask == *target) {
+        let removed = app.config.ignores.remove(pos);
+        app.cached_config_toml = None;
+        let _ = crate::config::save_config(&crate::constants::config_path(), &app.config);
+        add_local_event(
+            app,
+            &format!("{C_OK}Removed ignore rule: {}{C_RST}", removed.mask),
+        );
+    } else {
+        add_local_event(
+            app,
+            &format!("{C_ERR}No ignore rule matching: {target}{C_RST}"),
+        );
+    }
+}
+
+const fn parse_ignore_level(s: &str) -> Option<crate::config::IgnoreLevel> {
+    use crate::config::IgnoreLevel;
+    if s.eq_ignore_ascii_case("all") {
+        Some(IgnoreLevel::All)
+    } else if s.eq_ignore_ascii_case("msgs") {
+        Some(IgnoreLevel::Msgs)
+    } else if s.eq_ignore_ascii_case("public") {
+        Some(IgnoreLevel::Public)
+    } else if s.eq_ignore_ascii_case("notices") {
+        Some(IgnoreLevel::Notices)
+    } else if s.eq_ignore_ascii_case("actions") {
+        Some(IgnoreLevel::Actions)
+    } else if s.eq_ignore_ascii_case("joins") {
+        Some(IgnoreLevel::Joins)
+    } else if s.eq_ignore_ascii_case("parts") {
+        Some(IgnoreLevel::Parts)
+    } else if s.eq_ignore_ascii_case("quits") {
+        Some(IgnoreLevel::Quits)
+    } else if s.eq_ignore_ascii_case("nicks") {
+        Some(IgnoreLevel::Nicks)
+    } else if s.eq_ignore_ascii_case("kicks") {
+        Some(IgnoreLevel::Kicks)
+    } else if s.eq_ignore_ascii_case("ctcp") || s.eq_ignore_ascii_case("ctcps") {
+        Some(IgnoreLevel::Ctcps)
+    } else {
+        None
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn cmd_server(app: &mut App, args: &[String]) {
+    if args.is_empty() || args[0] == "list" {
+        let mut lines = vec![divider("Servers")];
+        if app.config.servers.is_empty() {
+            lines.push(format!("  {C_DIM}No servers configured{C_RST}"));
+        } else {
+            for (id, srv) in &app.config.servers {
+                let status = app.state.connections.get(id.as_str()).map_or_else(
+                    || "Not connected".to_string(),
+                    |c| format!("{:?}", c.status),
+                );
+                let tls = if srv.tls { " [TLS]" } else { "" };
+                let auto = if srv.autoconnect { " [auto]" } else { "" };
+                lines.push(format!(
+                    "  {C_CMD}{id}{C_RST} {C_DIM}{} {}:{}{tls}{auto} — {status}{C_RST}",
+                    srv.label, srv.address, srv.port
+                ));
+            }
+        }
+        lines.push(divider(""));
+        for line in &lines {
+            add_local_event(app, line);
+        }
+        return;
+    }
+
+    match args[0].as_str() {
+        "add" => {
+            if args.len() < 3 {
+                add_local_event(app, SERVER_ADD_USAGE);
+                return;
+            }
+            let id = args[1].to_lowercase();
+            let server_config = match parse_server_add_config(&args[2..]) {
+                Ok(config) => config,
+                Err(e) => {
+                    add_local_event(app, &format!("{C_ERR}{e}{C_RST}"));
+                    add_local_event(app, SERVER_ADD_USAGE);
+                    return;
+                }
+            };
+
+            let password = manual_cred(server_config.password.clone());
+            let sasl_pass = manual_cred(server_config.sasl_pass.clone());
+            let cfg_path = crate::constants::config_path();
+            let env_path = crate::constants::env_path();
+            let result = apply_server_config(
+                &mut app.config,
+                &cfg_path,
+                &env_path,
+                &id,
+                server_config,
+                password,
+                sasl_pass,
+            );
+            // config.servers was mutated in-memory regardless of save outcome.
+            app.cached_config_toml = None;
+            if let Err(e) = result {
+                add_local_event(app, &format!("{C_ERR}Failed to save server: {e}{C_RST}"));
+                return;
+            }
+            add_local_event(app, &format!("{C_OK}Server '{id}' added{C_RST}"));
+        }
+        "remove" => {
+            if args.len() < 2 {
+                add_local_event(app, "Usage: /server remove <id>");
+                return;
+            }
+            let id = &args[1];
+            if let Some(removed) = app.config.servers.remove(id) {
+                app.cached_config_toml = None;
+                // Only purge `.env` secrets once the server is actually gone
+                // from config.toml on disk: if the save fails the entry will
+                // reload on next start, and it must keep its credentials rather
+                // than come back password-less.
+                if let Err(e) =
+                    crate::config::save_config(&crate::constants::config_path(), &app.config)
+                {
+                    // Restore the in-memory entry so the session stays
+                    // consistent with the (unchanged) on-disk config — otherwise
+                    // the server vanishes from /server list until restart, then
+                    // silently reappears.
+                    app.config.servers.insert(id.clone(), removed);
+                    app.cached_config_toml = None;
+                    add_local_event(app, &format!("{C_ERR}Failed to save config: {e}{C_RST}"));
+                    return;
+                }
+                // Purge any credentials this server persisted to `.env`
+                // (`<ID>_PASSWORD` / `<ID>_SASL_PASS`, keyed off the uppercased
+                // id by apply_server_config) so removal leaves no stale secrets.
+                let upper = id.to_uppercase();
+                let env_path = crate::constants::env_path();
+                let pw = crate::config::env::remove_env_value(&env_path, &format!("{upper}_PASSWORD"));
+                let sasl =
+                    crate::config::env::remove_env_value(&env_path, &format!("{upper}_SASL_PASS"));
+                add_local_event(app, &format!("{C_OK}Server '{id}' removed{C_RST}"));
+                // The config entry is already gone from disk, so the removal
+                // itself succeeded — but a failed `.env` write would silently
+                // leave secrets behind. Surface that instead of swallowing it.
+                if let Err(e) = pw.and(sasl) {
+                    tracing::warn!("server '{id}' removed but .env credential purge failed: {e}");
+                    add_local_event(
+                        app,
+                        &format!(
+                            "{C_ERR}Warning: could not clear .env credentials ({e}); \
+                             they may remain in {}{C_RST}",
+                            env_path.display()
+                        ),
+                    );
+                }
+            } else {
+                add_local_event(app, &format!("{C_ERR}No server with id '{id}'{C_RST}"));
+            }
+        }
+        _ => {
+            add_local_event(app, "Usage: /server [list|add|remove] [args...]");
+        }
+    }
+}
+
+fn parse_server_add_config(args: &[String]) -> Result<crate::config::ServerConfig, String> {
+    let raw_address = args
+        .first()
+        .ok_or_else(|| "Missing server address".to_string())?;
+    let (address, parsed_port) = parse_address_port(raw_address)?;
+    let mut explicit_port = parsed_port.is_some();
+    let mut config = crate::config::ServerConfig {
+        label: address.clone(),
+        address,
+        port: parsed_port.unwrap_or(6667),
+        tls: false,
+        tls_verify: true,
+        autoconnect: true,
+        channels: vec![],
+        nick: None,
+        username: None,
+        realname: None,
+        password: None,
+        sasl_user: None,
+        sasl_pass: None,
+        bind_ip: None,
+        encoding: None,
+        auto_reconnect: None,
+        reconnect_delay: None,
+        reconnect_max_retries: None,
+        autosendcmd: None,
+        sasl_mechanism: None,
+        client_cert_path: None,
+    };
+
+    for arg in args.iter().skip(1) {
+        if let Ok(port) = arg.parse::<u16>() {
+            if explicit_port {
+                return Err("Port specified more than once".to_string());
+            }
+            config.port = port;
+            explicit_port = true;
+        } else if arg == "-tls" {
+            config.tls = true;
+        } else if arg == "-notls" {
+            config.tls = false;
+        } else if arg == "-tlsverify" {
+            config.tls_verify = true;
+        } else if arg == "-notlsverify" {
+            config.tls_verify = false;
+        } else if arg == "-auto" {
+            config.autoconnect = true;
+        } else if arg == "-noauto" {
+            config.autoconnect = false;
+        } else if let Some(value) = arg.strip_prefix("-label=") {
+            config.label = value.to_string();
+        } else if let Some(value) = arg.strip_prefix("-nick=") {
+            config.nick = Some(value.to_string());
+        } else if let Some(value) = arg.strip_prefix("-username=") {
+            config.username = Some(value.to_string());
+        } else if let Some(value) = arg.strip_prefix("-realname=") {
+            config.realname = Some(value.to_string());
+        } else if let Some(value) = arg.strip_prefix("-password=") {
+            config.password = Some(value.to_string());
+        } else if let Some(value) = arg.strip_prefix("-sasl=") {
+            let (user, pass) = value
+                .split_once(':')
+                .ok_or_else(|| "SASL format: -sasl=user:pass".to_string())?;
+            config.sasl_user = Some(user.to_string());
+            config.sasl_pass = Some(pass.to_string());
+        } else if let Some(value) = arg.strip_prefix("-sasl-user=") {
+            config.sasl_user = Some(value.to_string());
+        } else if let Some(value) = arg.strip_prefix("-sasl-pass=") {
+            config.sasl_pass = Some(value.to_string());
+        } else if let Some(value) = arg.strip_prefix("-sasl-mechanism=") {
+            config.sasl_mechanism = Some(value.to_string());
+        } else if let Some(value) = arg.strip_prefix("-channels=") {
+            config.channels = parse_csv(value);
+        } else if let Some(value) = arg.strip_prefix("-bind=") {
+            config.bind_ip = Some(value.to_string());
+        } else if let Some(value) = arg.strip_prefix("-encoding=") {
+            config.encoding = Some(value.to_string());
+        } else if let Some(value) = arg.strip_prefix("-autoreconnect=") {
+            config.auto_reconnect = Some(parse_server_add_bool(value)?);
+        } else if let Some(value) = arg.strip_prefix("-reconnect-delay=") {
+            config.reconnect_delay = Some(parse_u64_arg(value, "-reconnect-delay")?);
+        } else if let Some(value) = arg.strip_prefix("-reconnect-max-retries=") {
+            config.reconnect_max_retries = Some(parse_u32_arg(value, "-reconnect-max-retries")?);
+        } else if let Some(value) = arg.strip_prefix("-autosendcmd=") {
+            config.autosendcmd = Some(value.to_string());
+        } else if let Some(value) = arg.strip_prefix("-client-cert=") {
+            config.client_cert_path = Some(value.to_string());
+        } else if arg.starts_with('-') {
+            return Err(format!("Unknown /server add flag: {arg}"));
+        } else {
+            return Err(format!("Unexpected /server add argument: {arg}"));
+        }
+    }
+
+    if config.tls && config.port == 6667 {
+        config.port = 6697;
+    }
+
+    Ok(config)
+}
+
+fn parse_address_port(raw: &str) -> Result<(String, Option<u16>), String> {
+    if let Some(rest) = raw.strip_prefix('[')
+        && let Some((address, port)) = rest.split_once("]:")
+    {
+        return Ok((address.to_string(), Some(parse_port_arg(port)?)));
+    }
+
+    if let Some((address, port)) = raw.rsplit_once(':')
+        && !address.contains(':')
+    {
+        return Ok((address.to_string(), Some(parse_port_arg(port)?)));
+    }
+
+    Ok((raw.to_string(), None))
+}
+
+fn parse_port_arg(raw: &str) -> Result<u16, String> {
+    raw.parse().map_err(|_| format!("Invalid port: {raw}"))
+}
+
+fn parse_u64_arg(raw: &str, flag: &str) -> Result<u64, String> {
+    raw.parse()
+        .map_err(|_| format!("Expected positive integer for {flag}"))
+}
+
+fn parse_u32_arg(raw: &str, flag: &str) -> Result<u32, String> {
+    raw.parse()
+        .map_err(|_| format!("Expected positive integer for {flag}"))
+}
+
+fn parse_server_add_bool(raw: &str) -> Result<bool, String> {
+    match raw {
+        "true" | "yes" | "on" | "1" => Ok(true),
+        "false" | "no" | "off" | "0" => Ok(false),
+        _ => Err(format!("Expected boolean, got: {raw}")),
+    }
+}
+
+fn parse_csv(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+pub(crate) fn cmd_autoconnect(app: &mut App, args: &[String]) {
+    // Find the server ID for the current connection
+    let Some(conn_id) = app.active_conn_id().map(str::to_owned) else {
+        add_local_event(app, "No active connection");
+        return;
+    };
+
+    let Some(server) = app.config.servers.get_mut(&conn_id) else {
+        add_local_event(
+            app,
+            &format!("{C_ERR}Server '{conn_id}' not found in config{C_RST}"),
+        );
+        return;
+    };
+
+    if args.is_empty() {
+        // Toggle
+        server.autoconnect = !server.autoconnect;
+    } else {
+        match args[0].to_lowercase().as_str() {
+            "on" | "true" | "yes" | "1" => server.autoconnect = true,
+            "off" | "false" | "no" | "0" => server.autoconnect = false,
+            _ => {
+                add_local_event(app, "Usage: /autoconnect [on|off]");
+                return;
+            }
+        }
+    }
+
+    let status = if server.autoconnect { "on" } else { "off" };
+    let label = server.label.clone();
+    app.cached_config_toml = None;
+    let _ = crate::config::save_config(&crate::constants::config_path(), &app.config);
+    add_local_event(
+        app,
+        &format!("{C_OK}Autoconnect for {label}: {status}{C_RST}"),
+    );
+}
+
+// === Operator commands ===
+
+pub(crate) fn cmd_oper(app: &mut App, args: &[String]) {
+    if args.len() < 2 {
+        add_local_event(app, "Usage: /oper <name> <password>");
+        return;
+    }
+
+    if let Some(sender) = app.active_irc_sender() {
+        let _ = sender.send(irc::proto::Command::OPER(args[0].clone(), args[1].clone()));
+    } else {
+        add_local_event(app, "Not connected");
+    }
+}
+
+pub(crate) fn cmd_kill(app: &mut App, args: &[String]) {
+    if args.is_empty() {
+        add_local_event(app, "Usage: /kill <nick> [reason]");
+        return;
+    }
+
+    if let Some(sender) = app.active_irc_sender() {
+        let reason = if args.len() > 1 {
+            args[1].clone()
+        } else {
+            "Killed".to_string()
+        };
+        let _ = sender.send(irc::proto::Command::KILL(args[0].clone(), reason));
+    } else {
+        add_local_event(app, "Not connected");
+    }
+}
+
+pub(crate) fn cmd_wallops(app: &mut App, args: &[String]) {
+    if args.is_empty() {
+        add_local_event(app, "Usage: /wallops <message>");
+        return;
+    }
+
+    if let Some(sender) = app.active_irc_sender() {
+        let _ = sender.send(irc::proto::Command::Raw(
+            "WALLOPS".to_string(),
+            vec![args[0].clone()],
+        ));
+    } else {
+        add_local_event(app, "Not connected");
+    }
+}
+
+pub(crate) fn cmd_stats(app: &mut App, args: &[String]) {
+    if let Some(sender) = app.active_irc_sender() {
+        let query = args.first().cloned();
+        let server = args.get(1).cloned();
+        let _ = sender.send(irc::proto::Command::STATS(query, server));
+    } else {
+        add_local_event(app, "Not connected");
+    }
+}
+
+// === Logging ===
+
+pub(crate) fn cmd_log(app: &mut App, args: &[String]) {
+    let sub = args.first().map_or("status", String::as_str);
+
+    match sub {
+        "status" => log_status(app),
+        "search" => {
+            let query = args[1..].join(" ");
+            if query.is_empty() {
+                add_local_event(app, &format!("{C_ERR}Usage: /log search <query>{C_RST}"));
+            } else {
+                log_search(app, &query);
+            }
+        }
+        _ => add_local_event(
+            app,
+            &format!("{C_ERR}Usage: /log [status|search <query>]{C_RST}"),
+        ),
+    }
+}
+
+fn log_status(app: &mut App) {
+    // Collect all output lines first to avoid borrow conflicts
+    let lines: Vec<String> = if let Some(ref storage) = app.storage {
+        let count = storage
+            .db
+            .lock()
+            .ok()
+            .and_then(|db| storage::query::get_message_count(&db).ok())
+            .unwrap_or(0);
+        let encrypt_str = if storage.encrypt { "on" } else { "off" };
+        let fts_str = if storage.encrypt {
+            "unavailable (encrypted)"
+        } else {
+            "available"
+        };
+
+        let db_path = crate::constants::log_dir().join("messages.db");
+        let db_size = std::fs::metadata(&db_path).map_or(0, |m| m.len());
+        #[allow(clippy::cast_precision_loss)]
+        let size_str = if db_size > 1_048_576 {
+            format!("{:.1} MB", db_size as f64 / 1_048_576.0)
+        } else {
+            format!("{:.1} KB", db_size as f64 / 1024.0)
+        };
+
+        let retention = app.config.logging.retention_days;
+        let retention_str = if retention == 0 {
+            "forever".to_string()
+        } else {
+            format!("{retention} days")
+        };
+
+        let exclude = &app.config.logging.exclude_types;
+        let exclude_str = if exclude.is_empty() {
+            "none".to_string()
+        } else {
+            exclude.join(", ")
+        };
+
+        vec![
+            divider("Log Status"),
+            format!("  {C_DIM}Messages:{C_RST}    {C_CMD}{count}{C_RST}"),
+            format!("  {C_DIM}Database:{C_RST}    {C_CMD}{size_str}{C_RST}"),
+            format!("  {C_DIM}Encryption:{C_RST}  {C_CMD}{encrypt_str}{C_RST}"),
+            format!("  {C_DIM}Search:{C_RST}      {C_CMD}{fts_str}{C_RST}"),
+            format!("  {C_DIM}Retention:{C_RST}   {C_CMD}{retention_str}{C_RST}"),
+            format!("  {C_DIM}Excluded:{C_RST}    {C_CMD}{exclude_str}{C_RST}"),
+        ]
+    } else {
+        vec![format!(
+            "{C_DIM}Logging is {C_ERR}disabled{C_DIM} (set logging.enabled = true in config){C_RST}"
+        )]
+    };
+
+    for line in &lines {
+        add_local_event(app, line);
+    }
+}
+
+// === Image Preview ===
+
+pub(crate) fn cmd_preview(app: &mut App, args: &[String]) {
+    if args.is_empty() {
+        add_local_event(app, "Usage: /preview <url>");
+        return;
+    }
+    let url = &args[0];
+
+    if !app.config.image_preview.enabled {
+        add_local_event(
+            app,
+            &format!(
+                "{C_ERR}Image preview is disabled. Use /set image_preview.enabled true{C_RST}"
+            ),
+        );
+        return;
+    }
+
+    if crate::image_preview::detect::classify_url(url).is_none() {
+        add_local_event(
+            app,
+            &format!("{C_ERR}URL does not appear to be a valid HTTP(S) link{C_RST}"),
+        );
+        return;
+    }
+
+    app.show_image_preview(url);
+}
+
+#[allow(clippy::cast_precision_loss)]
+pub(crate) fn cmd_image(app: &mut App, args: &[String]) {
+    let subcmd = args.first().map_or("", String::as_str);
+    match subcmd {
+        "stats" => match crate::image_preview::cache::stats() {
+            Ok(s) => {
+                let size_mb = s.total_bytes as f64 / 1_048_576.0;
+                let age_days = s.oldest_age_secs / 86400;
+                add_local_event(
+                    app,
+                    &format!(
+                        "Image cache: {C_CMD}{}{C_RST} files, {C_CMD}{size_mb:.1}{C_RST} MB, oldest: {C_CMD}{age_days}{C_RST} days",
+                        s.total_files
+                    ),
+                );
+            }
+            Err(e) => add_local_event(app, &format!("{C_ERR}Cache stats error: {e}{C_RST}")),
+        },
+        "clear" => match crate::image_preview::cache::clear() {
+            Ok(count) => {
+                add_local_event(app, &format!("{C_OK}Cleared {count} cached images{C_RST}"));
+            }
+            Err(e) => add_local_event(app, &format!("{C_ERR}Cache clear error: {e}{C_RST}")),
+        },
+        "cleanup" => {
+            let max_mb = app.config.image_preview.cache_max_mb;
+            let max_days = app.config.image_preview.cache_max_days;
+            match crate::image_preview::cache::cleanup(max_mb, max_days) {
+                Ok(s) => {
+                    let mb = s.bytes_freed as f64 / 1_048_576.0;
+                    add_local_event(
+                        app,
+                        &format!(
+                            "{C_OK}Cleanup: removed {} files, freed {mb:.1} MB{C_RST}",
+                            s.files_removed
+                        ),
+                    );
+                }
+                Err(e) => add_local_event(app, &format!("{C_ERR}Cleanup error: {e}{C_RST}")),
+            }
+        }
+        "debug" => image_debug(app),
+        _ => {
+            let cfg = &app.config.image_preview;
+            let lines = vec![
+                divider("Image Preview"),
+                format!("  {C_DIM}Enabled:{C_RST}     {C_CMD}{}{C_RST}", cfg.enabled),
+                format!(
+                    "  {C_DIM}Protocol:{C_RST}    {C_CMD}{}{C_RST}",
+                    cfg.protocol
+                ),
+                format!(
+                    "  {C_DIM}Max width:{C_RST}   {C_CMD}{}{C_RST}",
+                    cfg.max_width
+                ),
+                format!(
+                    "  {C_DIM}Max height:{C_RST}  {C_CMD}{}{C_RST}",
+                    cfg.max_height
+                ),
+                format!(
+                    "  {C_DIM}Cache limit:{C_RST} {C_CMD}{} MB / {} days{C_RST}",
+                    cfg.cache_max_mb, cfg.cache_max_days
+                ),
+                divider(""),
+            ];
+            for line in &lines {
+                add_local_event(app, line);
+            }
+        }
+    }
+}
+
+// === Scripting ===
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn cmd_script(app: &mut App, args: &[String]) {
+    let sub = args.first().map_or("", String::as_str);
+
+    match sub {
+        "load" => {
+            if args.len() < 2 {
+                add_local_event(app, &format!("{C_ERR}Usage: /script load <name>{C_RST}"));
+                return;
+            }
+            let name = &args[1];
+            let Some(manager) = app.script_manager.as_mut() else {
+                add_local_event(app, &format!("{C_ERR}Script manager not available{C_RST}"));
+                return;
+            };
+            let Some(api) = app.script_api.as_ref() else {
+                add_local_event(app, &format!("{C_ERR}Script API not available{C_RST}"));
+                return;
+            };
+            match manager.load(name, api) {
+                Ok(meta) => {
+                    let desc = meta.description.as_deref().unwrap_or("");
+                    let ver = meta.version.as_deref().unwrap_or("?");
+                    add_local_event(
+                        app,
+                        &format!(
+                            "{C_OK}Loaded script: {C_CMD}{}{C_OK} v{ver} — {desc}{C_RST}",
+                            meta.name
+                        ),
+                    );
+                }
+                Err(e) => {
+                    add_local_event(
+                        app,
+                        &format!("{C_ERR}Failed to load script '{name}': {e}{C_RST}"),
+                    );
+                }
+            }
+        }
+        "unload" => {
+            if args.len() < 2 {
+                add_local_event(app, &format!("{C_ERR}Usage: /script unload <name>{C_RST}"));
+                return;
+            }
+            let name = &args[1];
+            let Some(manager) = app.script_manager.as_mut() else {
+                add_local_event(app, &format!("{C_ERR}Script manager not available{C_RST}"));
+                return;
+            };
+            match manager.unload(name) {
+                Ok(()) => {
+                    // Clean up per-script config entries to prevent unbounded growth
+                    // across repeated load/unload/reload cycles.
+                    app.script_config.retain(|(script, _), _| script != name);
+                    add_local_event(app, &format!("{C_OK}Unloaded script: {name}{C_RST}"));
+                }
+                Err(e) => {
+                    add_local_event(
+                        app,
+                        &format!("{C_ERR}Failed to unload '{name}': {e}{C_RST}"),
+                    );
+                }
+            }
+        }
+        "reload" => {
+            if args.len() < 2 {
+                add_local_event(app, &format!("{C_ERR}Usage: /script reload <name>{C_RST}"));
+                return;
+            }
+            let name = &args[1];
+            let Some(manager) = app.script_manager.as_mut() else {
+                add_local_event(app, &format!("{C_ERR}Script manager not available{C_RST}"));
+                return;
+            };
+            let Some(api) = app.script_api.as_ref() else {
+                add_local_event(app, &format!("{C_ERR}Script API not available{C_RST}"));
+                return;
+            };
+            match manager.reload(name, api) {
+                Ok(meta) => {
+                    let desc = meta.description.as_deref().unwrap_or("");
+                    let ver = meta.version.as_deref().unwrap_or("?");
+                    add_local_event(
+                        app,
+                        &format!(
+                            "{C_OK}Reloaded script: {C_CMD}{}{C_OK} v{ver} — {desc}{C_RST}",
+                            meta.name
+                        ),
+                    );
+                }
+                Err(e) => {
+                    add_local_event(
+                        app,
+                        &format!("{C_ERR}Failed to reload '{name}': {e}{C_RST}"),
+                    );
+                }
+            }
+        }
+        "list" | "" => {
+            let Some(manager) = app.script_manager.as_ref() else {
+                add_local_event(app, &format!("{C_ERR}Script manager not available{C_RST}"));
+                return;
+            };
+            let loaded = manager.loaded_scripts();
+            let available = manager.available_scripts();
+
+            let mut lines = vec![divider("Scripts")];
+
+            if loaded.is_empty() && available.is_empty() {
+                lines.push(format!(
+                    "  {C_DIM}No scripts found. Place .lua files in {}{C_RST}",
+                    manager.scripts_dir().display()
+                ));
+            } else {
+                if !loaded.is_empty() {
+                    lines.push(format!("  {C_CMD}Loaded:{C_RST}"));
+                    for meta in &loaded {
+                        let ver = meta.version.as_deref().unwrap_or("?");
+                        let desc = meta.description.as_deref().unwrap_or("");
+                        lines.push(format!(
+                            "    {C_OK}{}{C_RST} {C_DIM}v{ver} — {desc}{C_RST}",
+                            meta.name
+                        ));
+                    }
+                }
+
+                let unloaded: Vec<_> = available.iter().filter(|(_, _, loaded)| !loaded).collect();
+                if !unloaded.is_empty() {
+                    lines.push(format!("  {C_CMD}Available:{C_RST}"));
+                    for (name, _path, _) in &unloaded {
+                        lines.push(format!("    {C_DIM}{name}{C_RST}"));
+                    }
+                }
+            }
+            lines.push(divider(""));
+            for line in &lines {
+                add_local_event(app, line);
+            }
+        }
+        "autoload" => {
+            app.autoload_scripts();
+            let loaded_count = app
+                .script_manager
+                .as_ref()
+                .map_or(0, |m| m.loaded_scripts().len());
+            add_local_event(
+                app,
+                &format!("{C_OK}Autoloaded scripts ({loaded_count} loaded){C_RST}"),
+            );
+        }
+        "template" => {
+            add_local_event(app, &format!("{C_CMD}Lua script template:{C_RST}"));
+            for line in crate::scripting::api::LUA_SCRIPT_TEMPLATE.lines() {
+                add_local_event(app, &format!("  {C_DIM}{line}{C_RST}"));
+            }
+        }
+        _ => {
+            add_local_event(
+                app,
+                &format!(
+                    "{C_ERR}Usage: /script [load|unload|reload|list|autoload|template] [name]{C_RST}"
+                ),
+            );
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "debug output formatter — splitting fragments the template"
+)]
+fn image_debug(app: &mut App) {
+    // Re-detect now so debug shows current state, not stale startup state.
+    app.refresh_image_protocol();
+
+    let proto = app.picker.protocol_type();
+    let font = app.picker.font_size();
+    let caps = app.picker.capabilities();
+
+    // Collect env vars — use shim's env when socket-attached, daemon's env otherwise.
+    let env_override = app.shim_term_env.as_ref();
+    let get_env = |key: &str| -> String {
+        env_override.map_or_else(
+            || std::env::var(key).unwrap_or_default(),
+            |vars| vars.get(key).cloned().unwrap_or_default(),
+        )
+    };
+    let term = get_env("TERM");
+    let term_program = get_env("TERM_PROGRAM");
+    let lc_terminal = get_env("LC_TERMINAL");
+    let iterm_sess = get_env("ITERM_SESSION_ID");
+    let ghostty_res = get_env("GHOSTTY_RESOURCES_DIR");
+    let kitty_pid = get_env("KITTY_PID");
+    let colorterm = get_env("COLORTERM");
+
+    // tmux queries (only if in tmux)
+    let (tmux_termtype, tmux_termname, tmux_passthrough, tmux_version) = if app.in_tmux {
+        let tt = crate::app::tmux_query_raw("#{client_termtype}").unwrap_or_default();
+        let tn = crate::app::tmux_query_raw("#{client_termname}").unwrap_or_default();
+        let pt = std::process::Command::new("tmux")
+            .args(["show", "-p", "allow-passthrough"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        let ver = std::process::Command::new("tmux")
+            .args(["-V"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        (tt, tn, pt, ver)
+    } else {
+        (String::new(), String::new(), String::new(), String::new())
+    };
+
+    let mut lines = vec![divider("Image Debug")];
+
+    // Detection results
+    lines.push(format!(
+        "  {C_DIM}Protocol:{C_RST}        {C_CMD}{proto:?}{C_RST}"
+    ));
+    lines.push(format!(
+        "  {C_DIM}Source:{C_RST}          {C_CMD}{}{C_RST}",
+        app.image_proto_source
+    ));
+    lines.push(format!(
+        "  {C_DIM}Outer terminal:{C_RST}  {C_CMD}{}{C_RST}",
+        app.outer_terminal
+    ));
+    lines.push(format!(
+        "  {C_DIM}In tmux:{C_RST}         {C_CMD}{}{C_RST}",
+        app.in_tmux
+    ));
+    lines.push(format!(
+        "  {C_DIM}Font size:{C_RST}       {C_CMD}{}x{}{C_RST}",
+        font.0, font.1
+    ));
+    lines.push(format!(
+        "  {C_DIM}Capabilities:{C_RST}    {C_CMD}{caps:?}{C_RST}"
+    ));
+    lines.push(format!(
+        "  {C_DIM}Config proto:{C_RST}    {C_CMD}{}{C_RST}",
+        app.config.image_preview.protocol
+    ));
+
+    // tmux info
+    if app.in_tmux {
+        lines.push(format!(
+            "  {C_DIM}tmux version:{C_RST}   {C_CMD}{tmux_version}{C_RST}"
+        ));
+        lines.push(format!(
+            "  {C_DIM}passthrough:{C_RST}    {C_CMD}{tmux_passthrough}{C_RST}"
+        ));
+        lines.push(format!(
+            "  {C_DIM}client_termtype:{C_RST}{C_CMD} {tmux_termtype}{C_RST}"
+        ));
+        lines.push(format!(
+            "  {C_DIM}client_termname:{C_RST}{C_CMD} {tmux_termname}{C_RST}"
+        ));
+    }
+
+    // Env vars
+    lines.push(format!(
+        "  {C_DIM}TERM:{C_RST}            {C_CMD}{term}{C_RST}"
+    ));
+    lines.push(format!(
+        "  {C_DIM}TERM_PROGRAM:{C_RST}    {C_CMD}{term_program}{C_RST}"
+    ));
+    lines.push(format!(
+        "  {C_DIM}LC_TERMINAL:{C_RST}     {C_CMD}{lc_terminal}{C_RST}"
+    ));
+    lines.push(format!(
+        "  {C_DIM}COLORTERM:{C_RST}       {C_CMD}{colorterm}{C_RST}"
+    ));
+    if !iterm_sess.is_empty() {
+        lines.push(format!(
+            "  {C_DIM}ITERM_SESSION_ID:{C_RST}{C_CMD}{iterm_sess}{C_RST}"
+        ));
+    }
+    if !ghostty_res.is_empty() {
+        lines.push(format!(
+            "  {C_DIM}GHOSTTY_RESOURCES_DIR:{C_RST}{C_CMD}{ghostty_res}{C_RST}"
+        ));
+    }
+    if !kitty_pid.is_empty() {
+        lines.push(format!(
+            "  {C_DIM}KITTY_PID:{C_RST}       {C_CMD}{kitty_pid}{C_RST}"
+        ));
+    }
+
+    lines.push(divider(""));
+    for line in &lines {
+        add_local_event(app, line);
+    }
+}
+
+fn log_search(app: &mut App, query: &str) {
+    // Collect output lines to avoid borrow conflicts between storage and app
+    let lines: Vec<String> = if let Some(ref storage) = app.storage {
+        if storage.encrypt {
+            vec![format!(
+                "{C_ERR}Search is not available in encrypted mode{C_RST}"
+            )]
+        } else if let Ok(db) = storage.db.lock() {
+            // Determine current network/buffer context for scoped search
+            let (network, buffer) = if let Some(ref buf_id) = app.state.active_buffer_id {
+                if let Some((conn_id, buf_name)) = buf_id.split_once('/') {
+                    let net = app
+                        .state
+                        .connections
+                        .get(conn_id)
+                        .map_or_else(|| conn_id.to_string(), |c| c.label.clone());
+                    (Some(net), Some(buf_name.to_string()))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
+            match storage::query::search_messages(
+                &db,
+                query,
+                network.as_deref(),
+                buffer.as_deref(),
+                20,
+            ) {
+                Ok(results) if results.is_empty() => {
+                    vec![format!(
+                        "{C_DIM}No results for \"{C_CMD}{query}{C_DIM}\"{C_RST}"
+                    )]
+                }
+                Ok(results) => {
+                    let mut out = vec![divider(&format!("Search: {query}"))];
+                    for msg in &results {
+                        let ts = chrono::DateTime::from_timestamp(msg.timestamp, 0)
+                            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                            .unwrap_or_default();
+                        let nick = msg.nick.as_deref().unwrap_or("*");
+                        out.push(format!(
+                            "  {C_DIM}{ts}{C_RST} {C_CMD}<{nick}>{C_RST} {C_TEXT}{}{C_RST}",
+                            msg.text
+                        ));
+                    }
+                    out.push(format!("  {C_DIM}{} result(s){C_RST}", results.len()));
+                    out
+                }
+                Err(e) => vec![format!("{C_ERR}Search failed: {e}{C_RST}")],
+            }
+        } else {
+            vec![format!("{C_ERR}Failed to lock database{C_RST}")]
+        }
+    } else {
+        vec![format!("{C_ERR}Logging is disabled{C_RST}")]
+    };
+
+    for line in &lines {
+        add_local_event(app, line);
+    }
+}
+
+// === Spell Check ===
+
+pub(crate) fn cmd_spellcheck(app: &mut App, args: &[String]) {
+    let ev = add_local_event;
+    let sub = args.first().map_or("status", String::as_str);
+
+    match sub {
+        "status" => spellcheck_status(app),
+        "reload" => {
+            app.reload_spellchecker();
+            let loaded = app
+                .spellchecker
+                .as_ref()
+                .map_or(0, crate::spellcheck::SpellChecker::dict_count);
+            if loaded > 0 {
+                ev(
+                    app,
+                    &format!("{C_OK}Spell checker reloaded ({loaded} dictionaries){C_RST}"),
+                );
+            } else {
+                ev(
+                    app,
+                    &format!(
+                        "{C_ERR}No dictionaries loaded — place .dic/.aff files in {}{C_RST}",
+                        crate::spellcheck::SpellChecker::resolve_dict_dir(
+                            &app.config.spellcheck.dictionary_dir
+                        )
+                        .display()
+                    ),
+                );
+            }
+        }
+        "list" => {
+            ev(app, &format!("{C_DIM}Fetching dictionary list...{C_RST}"));
+            let dict_dir = crate::spellcheck::SpellChecker::resolve_dict_dir(
+                &app.config.spellcheck.dictionary_dir,
+            );
+            crate::spellcheck::spawn_fetch_manifest(
+                app.http_client.clone(),
+                dict_dir,
+                app.dict_tx.clone(),
+            );
+        }
+        "get" => {
+            let Some(lang) = args.get(1) else {
+                ev(
+                    app,
+                    &format!(
+                        "{C_ERR}Usage: /spellcheck get <lang> (e.g. en_US, pl_PL, computing){C_RST}"
+                    ),
+                );
+                return;
+            };
+            ev(app, &format!("{C_DIM}Downloading {lang}...{C_RST}"));
+            let dict_dir = crate::spellcheck::SpellChecker::resolve_dict_dir(
+                &app.config.spellcheck.dictionary_dir,
+            );
+            crate::spellcheck::spawn_download_dict(
+                lang.clone(),
+                app.http_client.clone(),
+                dict_dir,
+                app.dict_tx.clone(),
+            );
+        }
+        _ => {
+            ev(
+                app,
+                &format!("{C_ERR}Usage: /spellcheck [status|reload|list|get <lang>]{C_RST}"),
+            );
+        }
+    }
+}
+
+fn spellcheck_status(app: &mut App) {
+    let ev = add_local_event;
+    ev(app, &divider("Spell Check"));
+    let enabled = app.config.spellcheck.enabled;
+    let status = if enabled {
+        format!("{C_OK}enabled{C_RST}")
+    } else {
+        format!("{C_ERR}disabled{C_RST}")
+    };
+    ev(app, &format!("  Status: {status}"));
+    ev(
+        app,
+        &format!("  Mode: {C_CMD}{}{C_RST}", app.config.spellcheck.mode),
+    );
+    ev(
+        app,
+        &format!(
+            "  Languages: {C_CMD}{}{C_RST}",
+            app.config.spellcheck.languages.join(", ")
+        ),
+    );
+    let dict_dir =
+        crate::spellcheck::SpellChecker::resolve_dict_dir(&app.config.spellcheck.dictionary_dir);
+    ev(
+        app,
+        &format!("  Dictionary dir: {C_CMD}{}{C_RST}", dict_dir.display()),
+    );
+    let loaded = app
+        .spellchecker
+        .as_ref()
+        .map_or(0, crate::spellcheck::SpellChecker::dict_count);
+    ev(
+        app,
+        &format!("  Loaded dictionaries: {C_CMD}{loaded}{C_RST}"),
+    );
+    let computing_status = if !app.config.spellcheck.computing {
+        format!("{C_DIM}disabled{C_RST}")
+    } else if app
+        .spellchecker
+        .as_ref()
+        .is_some_and(crate::spellcheck::SpellChecker::has_computing)
+    {
+        format!("{C_OK}loaded{C_RST}")
+    } else {
+        format!("{C_ERR}not installed{C_RST} — run {C_CMD}/spellcheck get computing{C_RST}")
+    };
+    ev(app, &format!("  Computing dict: {computing_status}"));
+}
+
+// === Mentions ===
+
+pub(crate) fn cmd_mentions(app: &mut App, _args: &[String]) {
+    let ev = add_local_event;
+    if !app.config.display.mentions_buffer {
+        ev(
+            app,
+            &format!(
+                "{C_ERR}Mentions buffer is disabled — /set display.mentions_buffer true{C_RST}"
+            ),
+        );
+        return;
+    }
+    if !app.state.buffers.contains_key(App::MENTIONS_BUFFER_ID) {
+        app.create_mentions_buffer();
+    }
+    app.state.set_active_buffer(App::MENTIONS_BUFFER_ID);
+    app.scroll_offset = 0;
+}
+
+#[cfg(test)]
+mod server_add_tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn parses_all_server_config_fields() {
+        let config = parse_server_add_config(&args(&[
+            "irc.example.net:6697",
+            "-tls",
+            "-notlsverify",
+            "-noauto",
+            "-label=Example",
+            "-nick=nick",
+            "-username=user",
+            "-realname=real",
+            "-password=serverpass",
+            "-sasl=sasluser:saslpass",
+            "-sasl-mechanism=SCRAM-SHA-256",
+            "-channels=#one,#two",
+            "-bind=192.0.2.10",
+            "-encoding=UTF-8",
+            "-autoreconnect=false",
+            "-reconnect-delay=45",
+            "-reconnect-max-retries=3",
+            "-autosendcmd=/msg NickServ identify",
+            "-client-cert=/tmp/client.pem",
+        ]))
+        .unwrap();
+
+        assert_eq!(config.label, "Example");
+        assert_eq!(config.address, "irc.example.net");
+        assert_eq!(config.port, 6697);
+        assert!(config.tls);
+        assert!(!config.tls_verify);
+        assert!(!config.autoconnect);
+        assert_eq!(config.channels, vec!["#one", "#two"]);
+        assert_eq!(config.nick.as_deref(), Some("nick"));
+        assert_eq!(config.username.as_deref(), Some("user"));
+        assert_eq!(config.realname.as_deref(), Some("real"));
+        assert_eq!(config.password.as_deref(), Some("serverpass"));
+        assert_eq!(config.sasl_user.as_deref(), Some("sasluser"));
+        assert_eq!(config.sasl_pass.as_deref(), Some("saslpass"));
+        assert_eq!(config.bind_ip.as_deref(), Some("192.0.2.10"));
+        assert_eq!(config.encoding.as_deref(), Some("UTF-8"));
+        assert_eq!(config.auto_reconnect, Some(false));
+        assert_eq!(config.reconnect_delay, Some(45));
+        assert_eq!(config.reconnect_max_retries, Some(3));
+        assert_eq!(
+            config.autosendcmd.as_deref(),
+            Some("/msg NickServ identify")
+        );
+        assert_eq!(config.sasl_mechanism.as_deref(), Some("SCRAM-SHA-256"));
+        assert_eq!(config.client_cert_path.as_deref(), Some("/tmp/client.pem"));
+    }
+
+    #[test]
+    fn tls_default_port_becomes_6697() {
+        let config = parse_server_add_config(&args(&["irc.example.net", "-tls"])).unwrap();
+
+        assert_eq!(config.port, 6697);
+    }
+
+    #[test]
+    fn rejects_unknown_flags() {
+        let err = parse_server_add_config(&args(&["irc.example.net", "-bogus"])).unwrap_err();
+
+        assert!(err.contains("Unknown /server add flag"));
+    }
+
+    fn server_cfg(label: &str, address: &str) -> crate::config::ServerConfig {
+        crate::config::ServerConfig {
+            label: label.into(),
+            address: address.into(),
+            port: 6697,
+            tls: true,
+            tls_verify: true,
+            autoconnect: false,
+            channels: vec![],
+            nick: None,
+            username: None,
+            realname: None,
+            password: None,
+            sasl_user: None,
+            sasl_pass: None,
+            bind_ip: None,
+            encoding: None,
+            auto_reconnect: None,
+            reconnect_delay: None,
+            reconnect_max_retries: None,
+            autosendcmd: None,
+            sasl_mechanism: None,
+            client_cert_path: None,
+        }
+    }
+
+    #[test]
+    fn apply_server_config_writes_config_and_env_creds() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        let env_path = dir.path().join(".env");
+
+        let mut config = crate::config::AppConfig::default();
+        let base = server_cfg("Libera", "irc.libera.chat");
+
+        apply_server_config(
+            &mut config,
+            &cfg_path,
+            &env_path,
+            "libera",
+            base,
+            CredUpdate::Set("serverpass".into()),
+            CredUpdate::Set("saslpass".into()),
+        )
+        .unwrap();
+
+        // config.toml has the server but NOT the secrets.
+        let toml = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(toml.contains("irc.libera.chat"));
+        assert!(!toml.contains("serverpass"));
+        assert!(!toml.contains("saslpass"));
+        // .env has the secrets under the uppercased id.
+        let env = std::fs::read_to_string(&env_path).unwrap();
+        assert!(env.contains("LIBERA_PASSWORD=serverpass"));
+        assert!(env.contains("LIBERA_SASL_PASS=saslpass"));
+        // In-memory config carries the resolved creds.
+        let s = config.servers.get("libera").unwrap();
+        assert_eq!(s.password.as_deref(), Some("serverpass"));
+        assert_eq!(s.sasl_pass.as_deref(), Some("saslpass"));
+    }
+
+    #[test]
+    fn apply_server_config_keep_and_remove_creds() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        let env_path = dir.path().join(".env");
+        std::fs::write(&env_path, "LIBERA_PASSWORD=old\nLIBERA_SASL_PASS=oldsasl\n").unwrap();
+
+        let mut config = crate::config::AppConfig::default();
+        // The existing entry in config.servers is the source of truth for Keep.
+        let mut existing = server_cfg("Libera", "irc.libera.chat");
+        existing.password = Some("old".into());
+        existing.sasl_pass = Some("oldsasl".into());
+        config.servers.insert("libera".into(), existing);
+
+        // A re-add that keeps the password but clears SASL pass.
+        let updated = server_cfg("Libera", "irc.libera.chat");
+        apply_server_config(
+            &mut config,
+            &cfg_path,
+            &env_path,
+            "libera",
+            updated,
+            CredUpdate::Keep,
+            CredUpdate::Remove,
+        )
+        .unwrap();
+
+        let env = std::fs::read_to_string(&env_path).unwrap();
+        assert!(env.contains("LIBERA_PASSWORD=old")); // kept (untouched)
+        assert!(!env.contains("LIBERA_SASL_PASS")); // removed
+        let s = config.servers.get("libera").unwrap();
+        assert_eq!(s.password.as_deref(), Some("old")); // preserved in-memory too
+        assert!(s.sasl_pass.is_none());
+    }
+
+    #[test]
+    fn manual_cred_maps_flag_semantics() {
+        assert!(matches!(manual_cred(None), CredUpdate::Keep));
+        assert!(matches!(manual_cred(Some(String::new())), CredUpdate::Remove));
+        assert!(matches!(manual_cred(Some("pw".into())), CredUpdate::Set(v) if v == "pw"));
+    }
+
+    #[test]
+    fn re_add_without_password_flag_preserves_env_credential() {
+        // Regression guard: `/server add <existing> <addr>` (no -password) must
+        // not wipe the stored .env password.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        let env_path = dir.path().join(".env");
+        std::fs::write(&env_path, "LIBERA_PASSWORD=secret\n").unwrap();
+
+        let mut config = crate::config::AppConfig::default();
+        let mut existing = server_cfg("Libera", "irc.libera.chat");
+        existing.password = Some("secret".into());
+        config.servers.insert("libera".into(), existing);
+
+        // Re-add to change only the address; password flag omitted -> Keep.
+        let mut updated = server_cfg("Libera", "irc.libera.new");
+        updated.password = None;
+        let password = manual_cred(updated.password.clone());
+        let sasl_pass = manual_cred(updated.sasl_pass.clone());
+        apply_server_config(
+            &mut config, &cfg_path, &env_path, "libera", updated, password, sasl_pass,
+        )
+        .unwrap();
+
+        // .env credential survived, address updated.
+        assert!(std::fs::read_to_string(&env_path).unwrap().contains("LIBERA_PASSWORD=secret"));
+        let s = config.servers.get("libera").unwrap();
+        assert_eq!(s.address, "irc.libera.new");
+        assert_eq!(s.password.as_deref(), Some("secret"));
+    }
+}

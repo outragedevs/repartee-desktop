@@ -1,0 +1,184 @@
+use indexmap::IndexMap;
+use std::collections::HashMap;
+
+use tokio::sync::mpsc;
+
+pub mod buffer;
+pub mod connection;
+pub mod events;
+pub mod sorting;
+
+use buffer::Buffer;
+use connection::Connection;
+use connection::ConnectionStatus;
+
+use crate::config::IgnoreEntry;
+use crate::e2e::E2eManager;
+use crate::irc::flood::FloodState;
+use crate::irc::netsplit::NetsplitState;
+use crate::scripting::engine::{BufferInfo, ConnectionInfo, NickInfo, ScriptStateSnapshot};
+use crate::storage::LogRow;
+
+/// A queued outbound IRC NOTICE produced by the E2E event handlers.
+/// Drained by `App::drain_pending_e2e_sends` after each
+/// `handle_irc_message`, mirroring the `pending_web_events` pattern so
+/// event handlers can produce outbound traffic without holding a mutable
+/// borrow of `App`.
+#[derive(Debug, Clone)]
+pub struct PendingE2eSend {
+    /// Connection the NOTICE must be shipped over.
+    pub connection_id: String,
+    /// NOTICE target — peer nick for handshake replies.
+    pub target: String,
+    /// Full CTCP-framed body ready to hand to `send_notice` — i.e.
+    /// already wrapped in `\x01RPEE2E ...\x01`.
+    pub notice_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingUserhostAction {
+    E2eForget {
+        buffer_id: String,
+        target: String,
+        channel: Option<String>,
+        all: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingUserhostRequest {
+    pub connection_id: String,
+    pub nick: String,
+    pub action: PendingUserhostAction,
+}
+
+pub struct AppState {
+    pub connections: HashMap<String, Connection>,
+    pub buffers: IndexMap<String, Buffer>,
+    pub active_buffer_id: Option<String>,
+    pub previous_buffer_id: Option<String>,
+    pub message_counter: u64,
+    /// Flood detection state (global, not per-connection).
+    pub flood_state: FloodState,
+    /// Netsplit detection state (global, not per-connection).
+    pub netsplit_state: NetsplitState,
+    /// Whether flood protection is enabled (from config).
+    pub flood_protection: bool,
+    pub flood_exemptions: Vec<String>,
+    /// Ignore rules (from config).
+    pub ignores: Vec<IgnoreEntry>,
+    /// Sender for the storage writer. When `Some`, messages are logged to `SQLite`.
+    pub log_tx: Option<mpsc::Sender<LogRow>>,
+    /// Worker-queue sender for incoming-message shrink dispatch.
+    /// `None` when the feature is disabled (no API key, master switch
+    /// off, etc.). Pushed to from `add_message_with_activity` when
+    /// `shrink_incoming_active` is true and the message text has at
+    /// least one URL of length ≥ `shrink_min_url_length`. The worker
+    /// substitutes, then forwards a `ShrinkDeliver::Incoming` back to
+    /// the main loop which calls `state.add_message_with_activity`.
+    pub shrink_incoming_tx: Option<mpsc::Sender<crate::app::shrink::PendingIncoming>>,
+    /// True when shrink incoming substitution should be applied to
+    /// live PRIVMSG/ACTION/NOTICE messages. Mirror of
+    /// `(config.shrink.enabled && config.shrink.incoming_enabled &&
+    /// SHRINK_API_KEY is configured)`. Synced from `/set` so a
+    /// runtime flip takes effect without restart.
+    pub shrink_incoming_active: bool,
+    /// URL length threshold mirrored from `config.shrink.min_url_length`.
+    pub shrink_min_url_length: u32,
+    /// Message types excluded from logging (e.g. "event" to skip quit/join/nick fan-out).
+    pub log_exclude_types: Vec<String>,
+    /// Maximum messages per buffer (FIFO eviction). 0 = unlimited.
+    pub scrollback_limit: usize,
+    /// Pending web events to broadcast after IRC event processing.
+    /// Drained by `App` after each `handle_irc_message` call.
+    pub pending_web_events: Vec<crate::web::protocol::WebEvent>,
+    /// Pending E2E CTCP NOTICE sends produced by the event handlers.
+    /// Drained by `App::drain_pending_e2e_sends` right after
+    /// `drain_pending_web_events`. Same pattern as `pending_web_events`.
+    pub pending_e2e_sends: Vec<PendingE2eSend>,
+    pub pending_userhost_requests: Vec<PendingUserhostRequest>,
+    /// Nick color HSL saturation (synced from config for mention line formatting).
+    pub nick_color_sat: f32,
+    /// Nick color HSL lightness (synced from config for mention line formatting).
+    pub nick_color_lit: f32,
+    /// RPE2E manager, initialized once storage is up. `None` when the
+    /// `[e2e] enabled = false` config switch disables E2E entirely.
+    pub e2e_manager: Option<std::sync::Arc<E2eManager>>,
+    /// When set, `add_message` skips `MessageType::Event` lines so script
+    /// suppress hides the JOIN/PART/QUIT/MODE/etc. event display while the
+    /// underlying state mutation still runs. Set/cleared around a single
+    /// `handle_irc_message` call by the IRC dispatcher.
+    pub suppress_event_display: bool,
+    /// When `Some`, every `WireMessage` constructed for the web frontend has
+    /// its `previews` populated by this extractor. `None` = web image
+    /// previews disabled.
+    pub web_preview_extractor: Option<std::sync::Arc<crate::web::preview::WebPreviewExtractor>>,
+}
+
+impl AppState {
+    /// Build a lightweight snapshot of the current state for script callbacks.
+    pub fn script_snapshot(&self) -> ScriptStateSnapshot {
+        let connections: Vec<ConnectionInfo> = self
+            .connections
+            .values()
+            .map(|c| ConnectionInfo {
+                id: c.id.clone(),
+                label: c.label.clone(),
+                nick: c.nick.clone(),
+                connected: c.status == ConnectionStatus::Connected,
+                user_modes: c.user_modes.clone(),
+            })
+            .collect();
+
+        let buffers: Vec<BufferInfo> = self
+            .buffers
+            .values()
+            .map(|b| {
+                let bt = match b.buffer_type {
+                    buffer::BufferType::Mentions => "mentions",
+                    buffer::BufferType::Server => "server",
+                    buffer::BufferType::Channel => "channel",
+                    buffer::BufferType::Query => "query",
+                    buffer::BufferType::DccChat => "dcc_chat",
+                    buffer::BufferType::Special => "special",
+                    buffer::BufferType::Shell => "shell",
+                    buffer::BufferType::Log => "log",
+                };
+                BufferInfo {
+                    id: b.id.clone(),
+                    connection_id: b.connection_id.clone(),
+                    name: b.name.clone(),
+                    buffer_type: bt.to_string(),
+                    topic: b.topic.clone(),
+                    unread_count: b.unread_count,
+                }
+            })
+            .collect();
+
+        let mut buffer_nicks: HashMap<String, Vec<NickInfo>> = HashMap::new();
+        for (buf_id, buf) in &self.buffers {
+            if !buf.users.is_empty() {
+                let nicks = buf
+                    .users
+                    .values()
+                    .map(|e| NickInfo {
+                        nick: e.nick.clone(),
+                        prefix: e.prefix.clone(),
+                        modes: e.modes.clone(),
+                        away: e.away,
+                    })
+                    .collect();
+                buffer_nicks.insert(buf_id.clone(), nicks);
+            }
+        }
+
+        ScriptStateSnapshot {
+            active_buffer_id: self.active_buffer_id.clone(),
+            connections,
+            buffers,
+            buffer_nicks,
+            script_config: HashMap::new(),
+            app_config_toml: None,
+        }
+    }
+}

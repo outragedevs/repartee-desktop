@@ -1,0 +1,1188 @@
+pub mod batch;
+pub mod cap;
+pub mod events;
+pub mod extban;
+pub mod flood;
+pub mod formatting;
+pub mod ignore;
+pub mod isupport;
+pub mod netsplit;
+pub mod sasl_scram;
+
+use std::collections::HashSet;
+
+use base64::Engine as _;
+use color_eyre::eyre::{Result, eyre};
+use futures::StreamExt;
+use irc::client::prelude::*;
+use tokio::sync::mpsc;
+
+use crate::irc::cap::{DESIRED_CAPS, ServerCaps};
+
+const IRC_PING_TIMEOUT_SECS: u32 = 60;
+
+/// An IRC event forwarded from the reader task to the main loop.
+#[derive(Debug)]
+pub enum IrcEvent {
+    /// A raw IRC protocol message from the server.
+    Message(String, Box<irc::proto::Message>),
+    /// Registration complete (`RPL_WELCOME` received).
+    Connected(String, HashSet<String>),
+    /// The connection was lost, optionally with an error description.
+    Disconnected(String, Option<String>),
+    /// An IRC handle (sender) is ready after async connection completes.
+    /// Fields: `conn_id`, `sender`, `local_ip`, `outgoing_task_handle`.
+    HandleReady(
+        String,
+        irc::client::Sender,
+        Option<std::net::IpAddr>,
+        Option<tokio::task::JoinHandle<()>>,
+    ),
+    /// Diagnostic messages from CAP/SASL negotiation (fires immediately).
+    NegotiationInfo(String, Vec<String>),
+}
+
+/// Result of `IRCv3` capability negotiation.
+struct NegotiateResult {
+    /// Capabilities successfully enabled via `CAP REQ` / `CAP ACK`.
+    enabled_caps: HashSet<String>,
+    /// Human-readable diagnostic messages for the status buffer.
+    diagnostics: Vec<String>,
+    /// Messages consumed during negotiation that must be replayed
+    /// (e.g. `RPL_WELCOME` from non-`IRCv3` servers, pre-registration `NOTICE`s).
+    early_messages: Vec<irc::proto::Message>,
+}
+
+/// Handle to a connected IRC client, holding the connection ID and send-side.
+pub struct IrcHandle {
+    pub conn_id: String,
+    pub sender: irc::client::Sender,
+    /// Local IP of the TCP socket (for DCC own-IP fallback).
+    pub local_ip: Option<std::net::IpAddr>,
+    /// Handle to the outgoing message task spawned by the irc crate.
+    /// Aborted on disconnect to prevent CLOSE-WAIT socket leaks.
+    pub outgoing_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// SASL authentication mechanism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaslMechanism {
+    /// SASL PLAIN — username + password, base64-encoded.
+    Plain,
+    /// SASL EXTERNAL — client TLS certificate (`CertFP`) based.
+    External,
+    /// SASL SCRAM-SHA-256 — challenge-response (RFC 5802 / RFC 7677).
+    ScramSha256,
+}
+
+impl std::fmt::Display for SaslMechanism {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Plain => write!(f, "PLAIN"),
+            Self::External => write!(f, "EXTERNAL"),
+            Self::ScramSha256 => write!(f, "SCRAM-SHA-256"),
+        }
+    }
+}
+
+/// Select the best SASL mechanism given server capabilities and local config.
+///
+/// Priority when `sasl_mechanism` is `None` (auto-detect):
+/// 1. `EXTERNAL` — only if a `client_cert_path` is configured and the server advertises it.
+/// 2. `SCRAM-SHA-256` — if `sasl_user` + `sasl_pass` are configured and the server advertises it.
+/// 3. `PLAIN` — if `sasl_user` + `sasl_pass` are configured and the server advertises it.
+///
+/// When `sasl_mechanism` is explicitly set, that mechanism is used if the server supports it.
+/// Returns `None` if no suitable mechanism can be selected.
+#[must_use]
+pub fn select_sasl_mechanism(
+    server_mechanisms: &[String],
+    sasl_mechanism_override: Option<&str>,
+    has_client_cert: bool,
+    has_credentials: bool,
+) -> Option<SaslMechanism> {
+    let server_has = |mech: &str| {
+        server_mechanisms
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case(mech))
+    };
+
+    // Explicit override from config
+    if let Some(override_mech) = sasl_mechanism_override {
+        return match override_mech.to_ascii_uppercase().as_str() {
+            "EXTERNAL" if server_has("EXTERNAL") && has_client_cert => {
+                Some(SaslMechanism::External)
+            }
+            "SCRAM-SHA-256" if server_has("SCRAM-SHA-256") && has_credentials => {
+                Some(SaslMechanism::ScramSha256)
+            }
+            "PLAIN" if server_has("PLAIN") && has_credentials => Some(SaslMechanism::Plain),
+            _ => {
+                tracing::warn!(
+                    "configured SASL mechanism '{override_mech}' not available \
+                     (server offers: {}, cert={has_client_cert}, creds={has_credentials})",
+                    server_mechanisms.join(",")
+                );
+                None
+            }
+        };
+    }
+
+    // Auto-detect: prefer EXTERNAL, then SCRAM-SHA-256, then PLAIN
+    if has_client_cert && server_has("EXTERNAL") {
+        return Some(SaslMechanism::External);
+    }
+    if has_credentials && server_has("SCRAM-SHA-256") {
+        return Some(SaslMechanism::ScramSha256);
+    }
+    if has_credentials && server_has("PLAIN") {
+        return Some(SaslMechanism::Plain);
+    }
+
+    None
+}
+
+/// Timeout in seconds for SASL authentication steps.
+const SASL_TIMEOUT_SECS: u64 = 30;
+
+/// Wait for the server's `AUTHENTICATE +` reply with a timeout.
+///
+/// Handles SASL error numerics and connection closure. Used by all three
+/// SASL mechanism implementations to avoid duplicating the timeout + error
+/// handling logic.
+async fn await_authenticate_plus(stream: &mut irc::client::ClientStream) -> Result<()> {
+    let result = tokio::time::timeout(std::time::Duration::from_secs(SASL_TIMEOUT_SECS), async {
+        while let Some(msg_result) = stream.next().await {
+            let msg = msg_result?;
+            match &msg.command {
+                Command::AUTHENTICATE(param) if param == "+" => return Ok(()),
+                Command::Response(response, _) => match response {
+                    Response::ERR_SASLFAIL => return Err(eyre!("SASL authentication failed")),
+                    Response::ERR_SASLABORT => {
+                        return Err(eyre!("SASL authentication aborted"));
+                    }
+                    Response::ERR_SASLTOOLONG => {
+                        return Err(eyre!("SASL message too long"));
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        Err(eyre!("connection closed waiting for AUTHENTICATE +"))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(eyre!(
+            "SASL authentication timed out waiting for AUTHENTICATE +"
+        )),
+    }
+}
+
+/// Default maximum message body length in bytes.
+///
+/// IRC protocol limits total message length to 512 bytes including `\r\n`.
+/// The server prepends `:nick!user@host ` when relaying, which can consume
+/// up to ~160 bytes. Using 350 bytes for the body (matching irc-framework)
+/// leaves safe headroom.
+pub const MESSAGE_MAX_BYTES: usize = 350;
+
+/// Split a message into chunks that each fit within `max_bytes` of UTF-8.
+///
+/// Prefers word boundaries; falls back to character boundaries for very
+/// long words. Matches the behaviour of irc-framework's `lineBreak()`.
+#[must_use]
+pub fn split_irc_message(text: &str, max_bytes: usize) -> Vec<String> {
+    if text.len() <= max_bytes {
+        return vec![text.to_string()];
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    for word in WordSplitter::new(text) {
+        let combined_len = if current.is_empty() {
+            word.len()
+        } else {
+            current.len() + word.len()
+        };
+
+        if combined_len <= max_bytes {
+            current.push_str(word);
+            continue;
+        }
+
+        // Word alone fits on a new line — flush current, start new line.
+        if word.trim().len() <= max_bytes {
+            if !current.is_empty() {
+                lines.push(current);
+                current = String::new();
+            }
+            // Don't carry leading whitespace onto a continuation line.
+            current.push_str(word.trim_start());
+            continue;
+        }
+
+        // Word is too long even for a line — break at char boundaries.
+        for ch in word.chars() {
+            if current.len() + ch.len_utf8() > max_bytes && !current.is_empty() {
+                lines.push(current);
+                current = String::new();
+            }
+            current.push(ch);
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+
+    lines
+}
+
+/// Iterator that yields "word + trailing whitespace" chunks from a string,
+/// keeping whitespace attached to the preceding word so the caller can
+/// decide where to break.
+struct WordSplitter<'a> {
+    remaining: &'a str,
+}
+
+impl<'a> WordSplitter<'a> {
+    const fn new(s: &'a str) -> Self {
+        Self { remaining: s }
+    }
+}
+
+impl<'a> Iterator for WordSplitter<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        if self.remaining.is_empty() {
+            return None;
+        }
+
+        // Find end of non-whitespace (the word).
+        let word_end = self
+            .remaining
+            .find(char::is_whitespace)
+            .unwrap_or(self.remaining.len());
+
+        // Find end of trailing whitespace.
+        let ws_end = self.remaining[word_end..]
+            .find(|c: char| !c.is_whitespace())
+            .map_or(self.remaining.len(), |pos| word_end + pos);
+
+        let chunk = &self.remaining[..ws_end];
+        self.remaining = &self.remaining[ws_end..];
+        Some(chunk)
+    }
+}
+
+/// Resolve the effective local bind IP for an outgoing IRC socket.
+///
+/// Precedence (highest first):
+///   1. `server.bind_ip` — explicit per-server config (or `/connect
+///      -bind=` runtime override).
+///   2. `cli_override` — `repartee -h <ip>` CLI flag (runtime only).
+///   3. `general.default_bind_ip` — host-wide fallback from
+///      `[general]` in `config.toml`.
+///   4. `None` — let the kernel choose via the routing table.
+///
+/// Pulled into a free function with explicit args so it's trivially
+/// testable and behaves identically across the `/connect` and
+/// autoconnect/reconnect spawn paths.
+pub fn resolve_bind_ip(
+    server: &crate::config::ServerConfig,
+    cli_override: Option<&str>,
+    general: &crate::config::GeneralConfig,
+) -> Option<String> {
+    server
+        .bind_ip
+        .clone()
+        .or_else(|| cli_override.map(str::to_string))
+        .or_else(|| general.default_bind_ip.clone())
+}
+
+/// Connect to an IRC server, returning a handle and the event receiver.
+///
+/// Always performs capability negotiation (CAP LS 302), requesting all
+/// supported capabilities from [`DESIRED_CAPS`].  If SASL credentials or
+/// a client certificate are configured and the server supports SASL,
+/// performs the appropriate SASL authentication during negotiation.
+///
+/// Spawns a tokio task that reads from the message stream and forwards
+/// events over an unbounded channel.
+#[expect(clippy::too_many_lines, reason = "IRC config builder with many fields")]
+pub async fn connect_server(
+    conn_id: &str,
+    server_config: &crate::config::ServerConfig,
+    general: &crate::config::GeneralConfig,
+) -> Result<(IrcHandle, mpsc::Receiver<IrcEvent>)> {
+    let nick = server_config.nick.as_deref().unwrap_or(&general.nick);
+    let username = server_config
+        .username
+        .as_deref()
+        .unwrap_or(&general.username);
+    let realname = server_config
+        .realname
+        .as_deref()
+        .unwrap_or(&general.realname);
+
+    // Generate alt nicks so the irc crate can retry on ERR_NICKNAMEINUSE
+    // instead of fatally erroring with NoUsableNick.
+    let alt_nicks: Vec<String> = (1..=4)
+        .map(|i| format!("{nick}{}", "_".repeat(i)))
+        .collect();
+
+    let irc_config = Config {
+        nickname: Some(nick.to_string()),
+        alt_nicks,
+        username: Some(username.to_string()),
+        realname: Some(realname.to_string()),
+        server: Some(server_config.address.clone()),
+        port: Some(server_config.port),
+        use_tls: Some(server_config.tls),
+        dangerously_accept_invalid_certs: Some(!server_config.tls_verify),
+        password: server_config.password.clone(),
+        // Pass channels to the irc crate so it handles batched autojoin
+        // on ENDOFMOTD. Entries like "#channel key" are split into the
+        // channels vec (name only) and channel_keys map.
+        channels: server_config
+            .channels
+            .iter()
+            .map(|e| {
+                e.split_once(' ')
+                    .map_or_else(|| e.clone(), |(c, _)| c.to_string())
+            })
+            .collect(),
+        channel_keys: server_config
+            .channels
+            .iter()
+            .filter_map(|e| {
+                e.split_once(' ')
+                    .map(|(c, k)| (c.to_string(), k.to_string()))
+            })
+            .collect(),
+        encoding: server_config.encoding.clone(),
+        version: Some(general.ctcp_version.clone()),
+        client_cert_path: server_config.client_cert_path.clone(),
+        bind_address: server_config.bind_ip.clone(),
+        ping_timeout: Some(IRC_PING_TIMEOUT_SECS),
+        flood_penalty_threshold: Some(if general.flood_protection {
+            10_000 // default: 10s, matches IRCd excess flood limit
+        } else {
+            0 // disabled
+        }),
+        ..Config::default()
+    };
+
+    let mut client = Client::from_config(irc_config).await?;
+    let local_ip = client.local_addr().map(|a| a.ip());
+    let sender = client.sender();
+    let mut stream = client.stream()?;
+    // Extract the outgoing task handle so we can abort it on disconnect.
+    // Without this, the Pinger inside Outgoing holds a tx_outgoing clone
+    // that keeps the write half of the TCP socket alive (CLOSE-WAIT leak).
+    let outgoing_handle = client.outgoing_handle.take();
+
+    let reg_params = RegistrationParams {
+        nick,
+        username,
+        realname,
+        password: server_config.password.as_deref(),
+        sasl_user: server_config.sasl_user.as_deref(),
+        sasl_pass: server_config.sasl_pass.as_deref(),
+        sasl_mechanism_override: server_config.sasl_mechanism.as_deref(),
+        has_client_cert: server_config.client_cert_path.is_some(),
+    };
+
+    let neg = negotiate_caps(&sender, &mut stream, &reg_params).await?;
+
+    let (tx, rx) = mpsc::channel(4096);
+    let id = conn_id.to_string();
+    let id2 = id.clone();
+
+    // Spawn reader task
+    tokio::spawn(async move {
+        // Send negotiation diagnostics immediately so they're visible even if
+        // registration fails (e.g. server requires SASL but auth didn't complete).
+        let _ = tx
+            .send(IrcEvent::NegotiationInfo(id.clone(), neg.diagnostics))
+            .await;
+
+        let mut sent_connected = false;
+        let mut error = None;
+
+        // Replay messages consumed during capability negotiation.
+        // Non-IRCv3 servers that silently ignore CAP send RPL_WELCOME during
+        // negotiation; pre-registration NOTICEs may also be collected here.
+        for message in neg.early_messages {
+            if !sent_connected && let Command::Response(Response::RPL_WELCOME, _) = &message.command
+            {
+                sent_connected = true;
+                let _ = tx
+                    .send(IrcEvent::Connected(id.clone(), neg.enabled_caps.clone()))
+                    .await;
+            }
+            if tx
+                .send(IrcEvent::Message(id.clone(), Box::new(message)))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+
+        // Continue reading from the stream.
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(message) => {
+                    if !sent_connected
+                        && let Command::Response(Response::RPL_WELCOME, _) = &message.command
+                    {
+                        sent_connected = true;
+                        let _ = tx
+                            .send(IrcEvent::Connected(id.clone(), neg.enabled_caps.clone()))
+                            .await;
+                    }
+                    if tx
+                        .send(IrcEvent::Message(id.clone(), Box::new(message)))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    error = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        // Stream ended — send disconnect with error if any
+        let _ = tx.send(IrcEvent::Disconnected(id, error)).await;
+    });
+
+    Ok((
+        IrcHandle {
+            conn_id: id2,
+            sender,
+            local_ip,
+            outgoing_handle,
+        },
+        rx,
+    ))
+}
+
+/// Parameters for IRC connection registration, bundled to avoid long argument lists.
+struct RegistrationParams<'a> {
+    nick: &'a str,
+    username: &'a str,
+    realname: &'a str,
+    password: Option<&'a str>,
+    sasl_user: Option<&'a str>,
+    sasl_pass: Option<&'a str>,
+    sasl_mechanism_override: Option<&'a str>,
+    has_client_cert: bool,
+}
+
+/// Negotiate `IRCv3` capabilities and perform connection registration.
+///
+/// Sends `CAP LS 302` + `NICK` + `USER` together (the standard irssi/weechat
+/// approach).  `IRCv3` servers enter negotiation mode upon receiving `CAP LS`
+/// and **suspend** `NICK`/`USER` processing until `CAP END`.  Non-`IRCv3`
+/// servers either reply with `421 ERR_UNKNOWNCOMMAND` or silently ignore `CAP`
+/// and process `NICK`/`USER` immediately — detected by `RPL_WELCOME`.
+///
+/// Messages consumed during negotiation (pre-registration `NOTICE`s,
+/// `RPL_WELCOME` from non-`IRCv3` servers) are collected in
+/// [`NegotiateResult::early_messages`] for replay by the reader task.
+#[expect(clippy::too_many_lines, reason = "single linear negotiation flow")]
+async fn negotiate_caps(
+    sender: &irc::client::Sender,
+    stream: &mut irc::client::ClientStream,
+    params: &RegistrationParams<'_>,
+) -> Result<NegotiateResult> {
+    use irc::proto::command::CapSubCommand;
+    let mut diag: Vec<String> = Vec::new();
+    let mut early_messages: Vec<irc::proto::Message> = Vec::new();
+
+    // Step 1: Send CAP LS 302 + PASS + NICK + USER together.
+    //
+    // Per the IRCv3 specification, a server that receives CAP LS enters
+    // capability negotiation mode and suspends registration — NICK/USER are
+    // held until CAP END.  This means the registration timer does NOT start
+    // even if hostname lookup takes 30+ seconds (Libera IPv6 reverse DNS).
+    //
+    // Non-IRCv3 servers ignore CAP and process NICK/USER immediately,
+    // producing RPL_WELCOME (or 421 + RPL_WELCOME).
+    sender.send(Command::CAP(
+        None,
+        CapSubCommand::LS,
+        Some("302".to_string()),
+        None,
+    ))?;
+    if let Some(pass) = params.password {
+        sender.send(Command::PASS(pass.to_string()))?;
+    }
+    sender.send(Command::NICK(params.nick.to_string()))?;
+    sender.send(Command::USER(
+        params.username.to_string(),
+        "0".to_string(),
+        params.realname.to_string(),
+    ))?;
+
+    // Step 2: Wait for the server's response to determine IRCv3 support.
+    //
+    // Three possible outcomes:
+    // - CAP LS response      → IRCv3 server, proceed with full negotiation
+    // - 421 ERR_UNKNOWNCOMMAND → non-IRCv3 server, skip CAP (NICK/USER already sent)
+    // - RPL_WELCOME (001)    → non-IRCv3 that silently ignored CAP, already registered
+    let mut server_caps = ServerCaps::default();
+    let mut cap_supported = false;
+
+    while let Some(result) = stream.next().await {
+        let msg = result?;
+
+        // 421 ERR_UNKNOWNCOMMAND for CAP → non-IRCv3 server
+        if let Command::Response(Response::ERR_UNKNOWNCOMMAND, ref args) = msg.command
+            && args.iter().any(|a| a.eq_ignore_ascii_case("CAP"))
+        {
+            diag.push("CAP: server does not support IRCv3 capabilities".to_string());
+            break;
+        }
+
+        // RPL_WELCOME → server ignored CAP, already registered us
+        if let Command::Response(Response::RPL_WELCOME, _) = &msg.command {
+            diag.push("CAP: server does not support IRCv3 (registered without CAP)".to_string());
+            early_messages.push(msg);
+            break;
+        }
+
+        // CAP LS response → IRCv3 server
+        if let Command::CAP(_, CapSubCommand::LS, ref field3, ref field4) = msg.command {
+            let is_continuation = field3.as_deref() == Some("*");
+            let caps_str = if is_continuation {
+                field4.as_deref().unwrap_or("")
+            } else {
+                field3.as_deref().unwrap_or("")
+            };
+            server_caps.merge(caps_str);
+            if !is_continuation {
+                cap_supported = true;
+                break;
+            }
+        }
+
+        // Other messages (NOTICE about hostname/ident, PING, etc.) — save for replay
+        early_messages.push(msg);
+    }
+
+    let mut enabled_caps: HashSet<String> = HashSet::new();
+
+    if cap_supported {
+        // Determine whether we can authenticate via SASL
+        let has_credentials = params.sasl_user.is_some() && params.sasl_pass.is_some();
+        let server_mechanisms = server_caps.sasl_mechanisms();
+        let selected_mechanism = select_sasl_mechanism(
+            &server_mechanisms,
+            params.sasl_mechanism_override,
+            params.has_client_cert,
+            has_credentials,
+        );
+        let want_sasl = selected_mechanism.is_some();
+
+        diag.push(format!(
+            "CAP: server advertises sasl={}, has_credentials={has_credentials}, mechanism={:?}",
+            server_caps.has("sasl"),
+            selected_mechanism,
+        ));
+
+        // Compute capabilities to request
+        let mut caps_to_request = server_caps.negotiate(DESIRED_CAPS);
+
+        if !want_sasl {
+            caps_to_request.retain(|c| c != "sasl");
+        }
+
+        // Put sasl LAST so other caps are ACK'd regardless of SASL outcome
+        let sasl_requested = caps_to_request
+            .iter()
+            .position(|c| c == "sasl")
+            .is_some_and(|pos| {
+                caps_to_request.remove(pos);
+                caps_to_request.push("sasl".to_string());
+                true
+            });
+
+        // Send CAP REQ if there are any caps to request
+        if caps_to_request.is_empty() {
+            diag.push("CAP: no capabilities to request".to_string());
+        } else {
+            let req_str = caps_to_request.join(" ");
+            diag.push(format!("CAP REQ: {req_str}"));
+            sender.send(Command::CAP(None, CapSubCommand::REQ, None, Some(req_str)))?;
+
+            // Wait for ACK/NAK
+            while let Some(result) = stream.next().await {
+                let msg = result?;
+                if let Command::CAP(_, CapSubCommand::ACK, ref acked, _) = msg.command {
+                    if let Some(ref acked_str) = *acked {
+                        for cap in acked_str.split_whitespace() {
+                            enabled_caps.insert(cap.to_ascii_lowercase());
+                        }
+                    }
+                    diag.push(format!(
+                        "CAP ACK: {}",
+                        enabled_caps.iter().cloned().collect::<Vec<_>>().join(" "),
+                    ));
+                    break;
+                }
+                if let Command::CAP(_, CapSubCommand::NAK, ref naked, _) = msg.command {
+                    diag.push(format!(
+                        "CAP NAK: {}",
+                        naked.as_deref().unwrap_or("(unknown)"),
+                    ));
+                    break;
+                }
+            }
+        }
+
+        // If sasl was ACK'd, run the selected SASL flow
+        let sasl_acked = enabled_caps.contains("sasl");
+        if sasl_requested && sasl_acked {
+            if let Some(mechanism) = selected_mechanism {
+                let result = match mechanism {
+                    SaslMechanism::External => {
+                        diag.push("SASL: authenticating via EXTERNAL".to_string());
+                        run_sasl_external(sender, stream).await
+                    }
+                    SaslMechanism::ScramSha256 => {
+                        if let (Some(user), Some(pass)) = (params.sasl_user, params.sasl_pass) {
+                            diag.push(format!("SASL: authenticating via SCRAM-SHA-256 as {user}"));
+                            run_sasl_scram(sender, stream, user, pass).await
+                        } else {
+                            Err(eyre!("SASL SCRAM-SHA-256 selected but credentials missing"))
+                        }
+                    }
+                    SaslMechanism::Plain => {
+                        if let (Some(user), Some(pass)) = (params.sasl_user, params.sasl_pass) {
+                            diag.push(format!("SASL: authenticating via PLAIN as {user}"));
+                            run_sasl_plain(sender, stream, user, pass).await
+                        } else {
+                            Err(eyre!("SASL PLAIN selected but credentials missing"))
+                        }
+                    }
+                };
+                match result {
+                    Ok(()) => {
+                        diag.push(format!("SASL: {mechanism} authentication successful"));
+                    }
+                    Err(e) => {
+                        diag.push(format!("SASL: {mechanism} authentication FAILED: {e}"));
+                        enabled_caps.remove("sasl");
+                    }
+                }
+            }
+        } else if sasl_requested && !sasl_acked {
+            diag.push("SASL: requested but server did not ACK".to_string());
+        } else if !sasl_requested && has_credentials {
+            diag.push("SASL: credentials available but server does not advertise sasl".to_string());
+        }
+
+        // Send CAP END to finish capability negotiation.
+        // The server will now process the held NICK/USER commands.
+        sender.send(Command::CAP(None, CapSubCommand::END, None, None))?;
+    }
+
+    // NICK/USER were already sent in step 1 — no need to send them again.
+
+    Ok(NegotiateResult {
+        enabled_caps,
+        diagnostics: diag,
+        early_messages,
+    })
+}
+
+/// Execute the SASL PLAIN authentication handshake.
+///
+/// Assumes SASL has already been ACK'd.  Sends `AUTHENTICATE PLAIN`,
+/// waits for `+`, sends base64-encoded credentials, waits for 903/904.
+async fn run_sasl_plain(
+    sender: &irc::client::Sender,
+    stream: &mut irc::client::ClientStream,
+    sasl_user: &str,
+    sasl_pass: &str,
+) -> Result<()> {
+    // Send AUTHENTICATE PLAIN
+    sender.send(Command::AUTHENTICATE("PLAIN".to_string()))?;
+
+    // Wait for AUTHENTICATE + from server (with timeout and error handling)
+    await_authenticate_plus(stream).await?;
+
+    // Send base64-encoded credentials: authzid\0authcid\0password
+    let auth_string = format!("{sasl_user}\x00{sasl_user}\x00{sasl_pass}");
+    let encoded = base64::engine::general_purpose::STANDARD.encode(auth_string);
+    sender.send(Command::AUTHENTICATE(encoded))?;
+
+    // Wait for 903 (success) or 904/905/906 (failure)
+    while let Some(result) = stream.next().await {
+        let msg = result?;
+        if let Command::Response(response, _) = &msg.command {
+            match response {
+                Response::RPL_SASLSUCCESS => return Ok(()),
+                Response::ERR_SASLFAIL => return Err(eyre!("SASL authentication failed")),
+                Response::ERR_SASLTOOLONG => return Err(eyre!("SASL message too long")),
+                Response::ERR_SASLABORT => return Err(eyre!("SASL authentication aborted")),
+                _ => {}
+            }
+        }
+    }
+
+    Err(eyre!("SASL authentication: connection closed unexpectedly"))
+}
+
+/// Execute the SASL SCRAM-SHA-256 authentication handshake.
+///
+/// Assumes SASL has already been ACK'd.  Performs the three-step
+/// challenge-response protocol:
+///
+/// 1. Send `AUTHENTICATE SCRAM-SHA-256`, wait for `+`
+/// 2. Send base64-encoded client-first message, receive server-first
+/// 3. Send base64-encoded client-final message, receive server-final
+/// 4. Verify server signature and wait for 903/904
+async fn run_sasl_scram(
+    sender: &irc::client::Sender,
+    stream: &mut irc::client::ClientStream,
+    sasl_user: &str,
+    sasl_pass: &str,
+) -> Result<()> {
+    use base64::Engine as _;
+
+    let b64 = &base64::engine::general_purpose::STANDARD;
+
+    // Step 1: Initiate SCRAM-SHA-256
+    sender.send(Command::AUTHENTICATE("SCRAM-SHA-256".to_string()))?;
+
+    // Wait for AUTHENTICATE + from server (with timeout and error handling)
+    await_authenticate_plus(stream).await?;
+
+    // Step 2: Send client-first message
+    let (client_first_bare, client_first_full, client_nonce) = sasl_scram::client_first(sasl_user);
+    let encoded = b64.encode(&client_first_full);
+    for chunk in sasl_scram::chunk_authenticate(&encoded) {
+        sender.send(Command::AUTHENTICATE(chunk))?;
+    }
+
+    // Step 3: Receive server-first message
+    let server_first = loop {
+        if let Some(result) = stream.next().await {
+            let msg = result?;
+            match &msg.command {
+                Command::AUTHENTICATE(param) if param != "+" => {
+                    // Decode base64 server-first
+                    let decoded = b64
+                        .decode(param)
+                        .map_err(|e| eyre!("SCRAM: invalid base64 in server-first: {e}"))?;
+                    break String::from_utf8(decoded)
+                        .map_err(|e| eyre!("SCRAM: non-UTF-8 server-first: {e}"))?;
+                }
+                Command::Response(response, _) => match response {
+                    irc::proto::Response::ERR_SASLFAIL => {
+                        return Err(eyre!("SASL SCRAM-SHA-256 authentication failed"));
+                    }
+                    irc::proto::Response::ERR_SASLABORT => {
+                        return Err(eyre!("SASL SCRAM-SHA-256 authentication aborted"));
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        } else {
+            return Err(eyre!(
+                "SASL SCRAM-SHA-256: connection closed waiting for server-first"
+            ));
+        }
+    };
+
+    // Step 4: Compute and send client-final message
+    let (client_final_msg, expected_server_sig) =
+        sasl_scram::client_final(&server_first, &client_first_bare, &client_nonce, sasl_pass)?;
+    let encoded_final = b64.encode(&client_final_msg);
+    for chunk in sasl_scram::chunk_authenticate(&encoded_final) {
+        sender.send(Command::AUTHENTICATE(chunk))?;
+    }
+
+    // Step 5: Receive server-final and verify, then wait for 903/904
+    let mut server_verified = false;
+    while let Some(result) = stream.next().await {
+        let msg = result?;
+        match &msg.command {
+            Command::AUTHENTICATE(param) if !server_verified && param != "+" => {
+                let decoded = b64
+                    .decode(param)
+                    .map_err(|e| eyre!("SCRAM: invalid base64 in server-final: {e}"))?;
+                let server_final = String::from_utf8(decoded)
+                    .map_err(|e| eyre!("SCRAM: non-UTF-8 server-final: {e}"))?;
+                if !sasl_scram::verify_server(&server_final, &expected_server_sig) {
+                    return Err(eyre!(
+                        "SCRAM: server signature verification failed — possible MITM"
+                    ));
+                }
+                server_verified = true;
+            }
+            Command::Response(response, _) => match response {
+                irc::proto::Response::RPL_SASLSUCCESS => return Ok(()),
+                irc::proto::Response::ERR_SASLFAIL => {
+                    return Err(eyre!("SASL SCRAM-SHA-256 authentication failed"));
+                }
+                irc::proto::Response::ERR_SASLTOOLONG => {
+                    return Err(eyre!("SASL SCRAM-SHA-256 message too long"));
+                }
+                irc::proto::Response::ERR_SASLABORT => {
+                    return Err(eyre!("SASL SCRAM-SHA-256 authentication aborted"));
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    Err(eyre!("SASL SCRAM-SHA-256: connection closed unexpectedly"))
+}
+
+/// Execute the SASL EXTERNAL authentication handshake.
+///
+/// SASL EXTERNAL authenticates via the client TLS certificate already
+/// presented during the TLS handshake.  The flow is:
+///
+/// 1. Send `AUTHENTICATE EXTERNAL`
+/// 2. Wait for server's `AUTHENTICATE +`
+/// 3. Send `AUTHENTICATE +` (base64 of empty string — literal `+`)
+/// 4. Wait for `RPL_SASLSUCCESS` (903) or `ERR_SASLFAIL` (904)
+async fn run_sasl_external(
+    sender: &irc::client::Sender,
+    stream: &mut irc::client::ClientStream,
+) -> Result<()> {
+    // Send AUTHENTICATE EXTERNAL
+    sender.send(Command::AUTHENTICATE("EXTERNAL".to_string()))?;
+
+    // Wait for AUTHENTICATE + from server (with timeout and error handling)
+    await_authenticate_plus(stream).await?;
+
+    // Send AUTHENTICATE + (base64 encoding of an empty string is "+")
+    sender.send(Command::AUTHENTICATE("+".to_string()))?;
+
+    // Wait for 903 (success) or 904/905/906 (failure)
+    while let Some(result) = stream.next().await {
+        let msg = result?;
+        if let Command::Response(response, _) = &msg.command {
+            match response {
+                Response::RPL_SASLSUCCESS => return Ok(()),
+                Response::ERR_SASLFAIL => return Err(eyre!("SASL EXTERNAL authentication failed")),
+                Response::ERR_SASLTOOLONG => return Err(eyre!("SASL EXTERNAL message too long")),
+                Response::ERR_SASLABORT => {
+                    return Err(eyre!("SASL EXTERNAL authentication aborted"));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Err(eyre!("SASL EXTERNAL: connection closed unexpectedly"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_external_when_cert_configured() {
+        let server_mechs = vec!["PLAIN".to_string(), "EXTERNAL".to_string()];
+        let result = select_sasl_mechanism(&server_mechs, None, true, true);
+        // EXTERNAL is preferred over PLAIN when cert is available
+        assert_eq!(result, Some(SaslMechanism::External));
+    }
+
+    #[test]
+    fn select_plain_when_only_credentials() {
+        let server_mechs = vec!["PLAIN".to_string(), "EXTERNAL".to_string()];
+        let result = select_sasl_mechanism(&server_mechs, None, false, true);
+        assert_eq!(result, Some(SaslMechanism::Plain));
+    }
+
+    #[test]
+    fn explicit_override_plain() {
+        let server_mechs = vec!["PLAIN".to_string(), "EXTERNAL".to_string()];
+        // Even though cert is available, explicit override to PLAIN
+        let result = select_sasl_mechanism(&server_mechs, Some("PLAIN"), true, true);
+        assert_eq!(result, Some(SaslMechanism::Plain));
+    }
+
+    #[test]
+    fn explicit_override_external() {
+        let server_mechs = vec!["PLAIN".to_string(), "EXTERNAL".to_string()];
+        let result = select_sasl_mechanism(&server_mechs, Some("EXTERNAL"), true, false);
+        assert_eq!(result, Some(SaslMechanism::External));
+    }
+
+    #[test]
+    fn explicit_override_unavailable_mechanism() {
+        let server_mechs = vec!["PLAIN".to_string()];
+        // Server doesn't offer EXTERNAL
+        let result = select_sasl_mechanism(&server_mechs, Some("EXTERNAL"), true, true);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn no_credentials_no_cert() {
+        let server_mechs = vec!["PLAIN".to_string(), "EXTERNAL".to_string()];
+        let result = select_sasl_mechanism(&server_mechs, None, false, false);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn server_no_mechanisms() {
+        let server_mechs: Vec<String> = vec![];
+        let result = select_sasl_mechanism(&server_mechs, None, true, true);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn external_only_when_server_supports() {
+        // Server only offers PLAIN, but we have a cert
+        let server_mechs = vec!["PLAIN".to_string()];
+        let result = select_sasl_mechanism(&server_mechs, None, true, true);
+        // Falls through to PLAIN since server doesn't advertise EXTERNAL
+        assert_eq!(result, Some(SaslMechanism::Plain));
+    }
+
+    #[test]
+    fn case_insensitive_override() {
+        let server_mechs = vec!["PLAIN".to_string(), "EXTERNAL".to_string()];
+        let result = select_sasl_mechanism(&server_mechs, Some("external"), true, false);
+        assert_eq!(result, Some(SaslMechanism::External));
+    }
+
+    #[test]
+    fn sasl_mechanism_display() {
+        assert_eq!(SaslMechanism::Plain.to_string(), "PLAIN");
+        assert_eq!(SaslMechanism::External.to_string(), "EXTERNAL");
+        assert_eq!(SaslMechanism::ScramSha256.to_string(), "SCRAM-SHA-256");
+    }
+
+    #[test]
+    fn scram_preferred_over_plain() {
+        // When both SCRAM-SHA-256 and PLAIN are available, SCRAM wins
+        let server_mechs = vec!["PLAIN".to_string(), "SCRAM-SHA-256".to_string()];
+        let result = select_sasl_mechanism(&server_mechs, None, false, true);
+        assert_eq!(result, Some(SaslMechanism::ScramSha256));
+    }
+
+    #[test]
+    fn scram_falls_back_to_plain() {
+        // Server only offers PLAIN, no SCRAM-SHA-256
+        let server_mechs = vec!["PLAIN".to_string()];
+        let result = select_sasl_mechanism(&server_mechs, None, false, true);
+        assert_eq!(result, Some(SaslMechanism::Plain));
+    }
+
+    #[test]
+    fn explicit_override_scram() {
+        let server_mechs = vec!["PLAIN".to_string(), "SCRAM-SHA-256".to_string()];
+        let result = select_sasl_mechanism(&server_mechs, Some("SCRAM-SHA-256"), false, true);
+        assert_eq!(result, Some(SaslMechanism::ScramSha256));
+    }
+
+    #[test]
+    fn scram_override_unavailable() {
+        // Server doesn't offer SCRAM-SHA-256, override fails
+        let server_mechs = vec!["PLAIN".to_string()];
+        let result = select_sasl_mechanism(&server_mechs, Some("SCRAM-SHA-256"), false, true);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn external_still_preferred_over_scram() {
+        // EXTERNAL > SCRAM-SHA-256 when cert is available
+        let server_mechs = vec![
+            "PLAIN".to_string(),
+            "SCRAM-SHA-256".to_string(),
+            "EXTERNAL".to_string(),
+        ];
+        let result = select_sasl_mechanism(&server_mechs, None, true, true);
+        assert_eq!(result, Some(SaslMechanism::External));
+    }
+
+    // ── split_irc_message tests ─────────────────────────────
+
+    #[test]
+    fn short_message_not_split() {
+        let result = split_irc_message("hello world", 350);
+        assert_eq!(result, vec!["hello world"]);
+    }
+
+    #[test]
+    fn split_at_word_boundary() {
+        // 10-byte limit: "hello " is 6 bytes, "world" is 5 bytes — total 11 > 10
+        let result = split_irc_message("hello world", 10);
+        assert_eq!(result, vec!["hello ", "world"]);
+    }
+
+    #[test]
+    fn split_long_text_multiple_chunks() {
+        let text = "aaa bbb ccc ddd eee fff";
+        let result = split_irc_message(text, 12);
+        // "aaa bbb ccc " = 12, "ddd eee fff" = 11
+        assert_eq!(result.len(), 2);
+        // Each chunk should be <= 12 bytes
+        for chunk in &result {
+            assert!(chunk.len() <= 12, "chunk too long: '{chunk}'");
+        }
+    }
+
+    #[test]
+    fn very_long_word_split_at_chars() {
+        let text = "abcdefghij";
+        let result = split_irc_message(text, 5);
+        assert_eq!(result, vec!["abcde", "fghij"]);
+    }
+
+    #[test]
+    fn empty_message() {
+        let result = split_irc_message("", 350);
+        assert_eq!(result, vec![""]);
+    }
+
+    #[test]
+    fn unicode_message_split() {
+        // Each emoji is 4 bytes. 3 emojis = 12 bytes.
+        let text = "🦀🦀🦀";
+        let result = split_irc_message(text, 8);
+        assert_eq!(result, vec!["🦀🦀", "🦀"]);
+    }
+
+    #[test]
+    fn lorem_ipsum_split() {
+        let text = "Lorem ipsum dolor sit amet, consetetur sadipscing elitr, \
+                    sed diam nonumy eirmod tempor invidunt ut labore et dolore \
+                    magna aliquyam erat, sed diam voluptua.";
+        let result = split_irc_message(text, MESSAGE_MAX_BYTES);
+        // The full text is ~170 bytes, well under 350 — should not be split.
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn lorem_ipsum_long_split() {
+        let text = "Lorem ipsum dolor sit amet, consetetur sadipscing elitr, \
+                    sed diam nonumy eirmod tempor invidunt ut labore et dolore \
+                    magna aliquyam erat, sed diam voluptua. At vero eos et accusam \
+                    et justo duo dolores et ea rebum. Stet clita kasd gubergren, \
+                    no sea takimata sanctus est Lorem ipsum dolor sit amet. Lorem \
+                    ipsum dolor sit amet, consetetur sadipscing elitr, sed diam \
+                    nonumy eirmod tempor invidunt ut labore et dolore magna \
+                    aliquyam erat, sed diam voluptua.";
+        let result = split_irc_message(text, MESSAGE_MAX_BYTES);
+        assert!(
+            result.len() >= 2,
+            "expected multiple chunks, got {}",
+            result.len()
+        );
+        // Every chunk must fit within the limit.
+        for (i, chunk) in result.iter().enumerate() {
+            assert!(
+                chunk.len() <= MESSAGE_MAX_BYTES,
+                "chunk {i} is {} bytes (max {MESSAGE_MAX_BYTES}): '{chunk}'",
+                chunk.len(),
+            );
+        }
+        // Reassembled text should equal original (minus whitespace trimming at break points).
+        let reassembled: String = result.join(" ");
+        // Word-level comparison (whitespace at break points may differ).
+        let orig_words: Vec<&str> = text.split_whitespace().collect();
+        let re_words: Vec<&str> = reassembled.split_whitespace().collect();
+        assert_eq!(orig_words, re_words);
+    }
+
+    fn server_with(bind: Option<&str>) -> crate::config::ServerConfig {
+        crate::config::ServerConfig {
+            label: "test".into(),
+            address: "irc.example".into(),
+            port: 6697,
+            tls: true,
+            tls_verify: true,
+            autoconnect: false,
+            channels: vec![],
+            nick: None,
+            username: None,
+            realname: None,
+            password: None,
+            sasl_user: None,
+            sasl_pass: None,
+            bind_ip: bind.map(str::to_string),
+            encoding: None,
+            auto_reconnect: None,
+            reconnect_delay: None,
+            reconnect_max_retries: None,
+            autosendcmd: None,
+            sasl_mechanism: None,
+            client_cert_path: None,
+        }
+    }
+
+    fn general_with(default_bind: Option<&str>) -> crate::config::GeneralConfig {
+        crate::config::GeneralConfig {
+            default_bind_ip: default_bind.map(str::to_string),
+            ..crate::config::GeneralConfig::default()
+        }
+    }
+
+    #[test]
+    fn resolve_bind_ip_prefers_per_server() {
+        let s = server_with(Some("10.0.0.1"));
+        let g = general_with(Some("10.0.0.99"));
+        let r = resolve_bind_ip(&s, Some("10.0.0.50"), &g);
+        // Per-server wins over both CLI and default.
+        assert_eq!(r.as_deref(), Some("10.0.0.1"));
+    }
+
+    #[test]
+    fn resolve_bind_ip_falls_back_to_cli() {
+        let s = server_with(None);
+        let g = general_with(Some("10.0.0.99"));
+        let r = resolve_bind_ip(&s, Some("10.0.0.50"), &g);
+        // No per-server bind: CLI override beats general default.
+        assert_eq!(r.as_deref(), Some("10.0.0.50"));
+    }
+
+    #[test]
+    fn resolve_bind_ip_falls_back_to_default() {
+        let s = server_with(None);
+        let g = general_with(Some("10.0.0.99"));
+        let r = resolve_bind_ip(&s, None, &g);
+        assert_eq!(r.as_deref(), Some("10.0.0.99"));
+    }
+
+    #[test]
+    fn resolve_bind_ip_returns_none_when_nothing_set() {
+        let s = server_with(None);
+        let g = general_with(None);
+        let r = resolve_bind_ip(&s, None, &g);
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn resolve_bind_ip_empty_string_treated_as_value() {
+        // Defensive: an empty string IS Some("") and would propagate
+        // — make the precedence rule explicit so a future regression
+        // (e.g. someone normalises empty -> None at a different layer)
+        // is caught here rather than at runtime.
+        let s = server_with(Some(""));
+        let g = general_with(Some("10.0.0.99"));
+        let r = resolve_bind_ip(&s, None, &g);
+        assert_eq!(r.as_deref(), Some(""));
+    }
+}

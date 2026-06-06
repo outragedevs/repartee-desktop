@@ -1,0 +1,666 @@
+use std::collections::{HashMap, HashSet};
+
+use leptos::prelude::*;
+
+use crate::protocol::*;
+
+/// Per-buffer cap on in-memory rendered messages. Older lines are
+/// dropped from the head (oldest-first) when the cap is exceeded; the
+/// DB still holds full history for scroll-back via `FetchMessages`.
+///
+/// 1000 strikes the balance: deep enough to cover typical IRC sessions
+/// without scroll-back, shallow enough that the DOM stays light. We
+/// don't index-virtualize the list — IRC chat lines have wildly
+/// variable heights (single line vs. wrapped paragraph vs. 200 px
+/// image preview), which makes naive index-based virtualization
+/// wrong (scrollbar size, jump-to-position) and proper
+/// measurement-based virtualization a substantial undertaking.
+/// Instead, the per-message DOM uses CSS `content-visibility: auto`
+/// (see `web-ui/styles/base.css`), letting the browser skip layout
+/// and paint for off-screen lines natively — same end-state, almost
+/// free, with no JS scroll-handling complexity.
+const MAX_BUFFER_MESSAGES: usize = 1000;
+
+/// Client-side application state, stored as Leptos signals.
+#[derive(Clone, Copy)]
+pub struct AppState {
+    pub authenticated: RwSignal<bool>,
+    pub connected: RwSignal<bool>,
+    pub buffers: RwSignal<Vec<BufferMeta>>,
+    pub connections: RwSignal<Vec<ConnectionMeta>>,
+    pub active_buffer: RwSignal<Option<String>>,
+    pub messages: RwSignal<HashMap<String, Vec<WireMessage>>>,
+    pub nick_lists: RwSignal<HashMap<String, Vec<WireNick>>>,
+    pub mention_count: RwSignal<u32>,
+    pub session_hint: RwSignal<bool>,
+    pub theme: RwSignal<String>,
+    pub error: RwSignal<Option<String>>,
+    pub timestamp_format: RwSignal<String>,
+    pub line_height: RwSignal<f32>,
+    pub nick_column_width: RwSignal<u32>,
+    pub nick_max_length: RwSignal<u32>,
+    pub nick_colors_enabled: RwSignal<bool>,
+    pub nick_colors_in_nicklist: RwSignal<bool>,
+    pub nick_color_saturation: RwSignal<f32>,
+    pub nick_color_lightness: RwSignal<f32>,
+    /// Shell screen content for the active shell buffer.
+    pub shell_screen: RwSignal<Option<crate::protocol::ShellScreenData>>,
+    /// Bumped on every SyncInit (initial connect or lag recovery).
+    /// Read with `get_untracked()` only — the Layout Effect uses it as
+    /// part of its in-flight FetchMessages dedup key, NOT as a reactive
+    /// trigger. The reactive trigger is `active_buffer` (Leptos 0.7
+    /// `.set()` fires subscribers regardless of value equality).
+    pub sync_version: RwSignal<u32>,
+    /// Tracks which buffers have had their DB backlog fetched via FetchMessages.
+    /// Prevents the Layout Effect from skipping the fetch when only live
+    /// NewMessage events are cached (the root cause of empty-buffer-on-switch).
+    pub backlog_loaded: RwSignal<HashSet<String>>,
+    /// Whether the chat view is scrolled to (or near) the bottom.
+    /// When true, new messages auto-scroll. When false, the user is reading
+    /// backlog and the view stays put.
+    pub is_at_bottom: RwSignal<bool>,
+    /// Per-message preview dismissals: `(message_id, link)` pairs. Persisted
+    /// to localStorage so a "hide this thumbnail" decision survives reload.
+    pub dismissed_previews: RwSignal<HashSet<(u64, String)>>,
+    /// Whether `:name:` tokens render as inline emote images (mirrors the
+    /// server's `[emotes]` config; pushed via `SettingsChanged`).
+    pub emotes_enabled: RwSignal<bool>,
+    /// Server wizard modal open flag. The web wizard is add-only (the client has
+    /// no full server config to pre-fill an edit), so there is no edit-id here.
+    pub wizard_open: RwSignal<bool>,
+    /// GG emote (`:name:` GIF) picker modal open flag.
+    pub emote_picker_open: RwSignal<bool>,
+    /// UTF-8 Unicode emoji picker modal open flag (desktop only).
+    pub emoji_picker_open: RwSignal<bool>,
+    /// A token to splice into the input at the caret (`:name:` or a Unicode
+    /// emoji). The input component consumes it and clears it back to `None`.
+    pub pending_insert: RwSignal<Option<String>>,
+}
+
+impl AppState {
+    pub fn new() -> Self {
+        // Load theme from localStorage if available.
+        let saved_theme: String = web_sys::window()
+            .and_then(|w| w.local_storage().ok().flatten())
+            .and_then(|s: web_sys::Storage| s.get_item("repartee-theme").ok().flatten())
+            .unwrap_or_else(|| "nightfall".to_string());
+
+        Self {
+            authenticated: RwSignal::new(false),
+            connected: RwSignal::new(false),
+            buffers: RwSignal::new(Vec::new()),
+            connections: RwSignal::new(Vec::new()),
+            active_buffer: RwSignal::new(None),
+            messages: RwSignal::new(HashMap::new()),
+            nick_lists: RwSignal::new(HashMap::new()),
+            mention_count: RwSignal::new(0),
+            session_hint: RwSignal::new(false),
+            theme: RwSignal::new(saved_theme),
+            error: RwSignal::new(None),
+            timestamp_format: RwSignal::new("%H:%M".to_string()),
+            line_height: RwSignal::new(1.35),
+            nick_column_width: RwSignal::new(12),
+            nick_max_length: RwSignal::new(9),
+            nick_colors_enabled: RwSignal::new(true),
+            nick_colors_in_nicklist: RwSignal::new(true),
+            nick_color_saturation: RwSignal::new(0.65),
+            nick_color_lightness: RwSignal::new(0.65),
+            shell_screen: RwSignal::new(None),
+            sync_version: RwSignal::new(0),
+            backlog_loaded: RwSignal::new(HashSet::new()),
+            is_at_bottom: RwSignal::new(true),
+            dismissed_previews: RwSignal::new(load_dismissed_previews()),
+            emotes_enabled: RwSignal::new(true),
+            wizard_open: RwSignal::new(false),
+            emote_picker_open: RwSignal::new(false),
+            emoji_picker_open: RwSignal::new(false),
+            pending_insert: RwSignal::new(None),
+        }
+    }
+
+    /// Handle a WebEvent from the server, updating signals accordingly.
+    pub fn handle_event(&self, event: WebEvent) {
+        match event {
+            WebEvent::SyncInit {
+                buffers,
+                connections,
+                mention_count,
+                active_buffer_id,
+                timestamp_format,
+                emotes_enabled,
+            } => {
+                // Clear cached messages, nick lists, and backlog-loaded flags —
+                // forces re-fetch. Handles both initial connect and lag-recovery resync.
+                self.messages.set(HashMap::new());
+                self.nick_lists.set(HashMap::new());
+                self.backlog_loaded.set(HashSet::new());
+
+                self.buffers.set(buffers);
+                self.connections.set(connections);
+                self.mention_count.set(mention_count);
+                self.emotes_enabled.set(emotes_enabled);
+                self.authenticated.set(true);
+                self.connected.set(true);
+                if let Some(fmt) = timestamp_format
+                    && !fmt.is_empty()
+                {
+                    self.timestamp_format.set(fmt);
+                }
+
+                self.sort_buffers();
+
+                // Bump sync_version FIRST so the Layout Effect's
+                // pending-fetch dedup (keyed by (buffer_id, sync_version))
+                // admits a new fetch for the active buffer under the new
+                // epoch — even if the buffer ID is the same as before.
+                self.sync_version.update(|v| *v += 1);
+
+                // Sync to the TUI's active buffer. A single `.set()` is
+                // enough to re-fire the Layout Effect (Leptos 0.7 fires
+                // subscribers regardless of value equality), so we don't
+                // need the old `set(None) + set(Some)` dance — that
+                // dance was the cause of the double-FetchMessages /
+                // duplicate-line bug.
+                if let Some(ref id) = active_buffer_id {
+                    self.active_buffer.set(Some(id.clone()));
+                } else {
+                    // Fallback: select first channel buffer.
+                    let bufs = self.buffers.get_untracked();
+                    if let Some(first) = bufs.iter().find(|b| b.buffer_type == "channel") {
+                        self.active_buffer.set(Some(first.id.clone()));
+                    } else {
+                        // No channel — retrigger current value so the
+                        // Effect fires under the new epoch even though
+                        // the buffer ID didn't change.
+                        let current = self.active_buffer.get_untracked();
+                        if current.is_some() {
+                            self.active_buffer.set(current);
+                        }
+                    }
+                }
+            }
+            WebEvent::NewMessage { buffer_id, message } => {
+                self.messages.update(|msgs| {
+                    let entry = msgs.entry(buffer_id.clone()).or_default();
+                    // Dedup by id — guards against the SyncInit →
+                    // FetchMessages round-trip race where the same
+                    // message arrives as both a live NewMessage and
+                    // inside the fetched backlog snapshot. id=0 is
+                    // reserved for date separators and is not unique,
+                    // so always admit those.
+                    if message.id == 0 || !entry.iter().any(|m| m.id == message.id) {
+                        entry.push(message);
+                        cap_messages(entry);
+                    }
+                });
+                // Update unread count if not the active buffer.
+                let is_active = self.active_buffer.get_untracked().as_deref() == Some(&buffer_id);
+                if !is_active {
+                    self.buffers.update(|bufs| {
+                        if let Some(b) = bufs.iter_mut().find(|b| b.id == buffer_id) {
+                            b.unread_count += 1;
+                        }
+                    });
+                }
+            }
+            WebEvent::TopicChanged {
+                buffer_id, topic, ..
+            } => {
+                self.buffers.update(|bufs| {
+                    if let Some(b) = bufs.iter_mut().find(|b| b.id == buffer_id) {
+                        b.topic = topic;
+                    }
+                });
+            }
+            WebEvent::ActivityChanged {
+                buffer_id,
+                activity,
+                unread_count,
+            } => {
+                self.buffers.update(|bufs| {
+                    if let Some(b) = bufs.iter_mut().find(|b| b.id == buffer_id) {
+                        b.activity = activity;
+                        b.unread_count = unread_count;
+                    }
+                });
+            }
+            WebEvent::BufferCreated { buffer } => {
+                let new_id = buffer.id.clone();
+                self.buffers.update(|bufs| bufs.push(buffer));
+                self.sort_buffers();
+                // Auto-switch to newly created buffer (matches terminal behavior).
+                self.active_buffer.set(Some(new_id));
+            }
+            WebEvent::BufferClosed { buffer_id } => {
+                // If the closed buffer was active, switch to first available.
+                if self.active_buffer.get_untracked().as_deref() == Some(&buffer_id) {
+                    let bufs = self.buffers.get_untracked();
+                    let fallback = bufs
+                        .iter()
+                        .find(|b| b.id != buffer_id)
+                        .map(|b| b.id.clone());
+                    self.active_buffer.set(fallback);
+                }
+                self.buffers
+                    .update(|bufs| bufs.retain(|b| b.id != buffer_id));
+                self.messages.update(|msgs| {
+                    msgs.remove(&buffer_id);
+                });
+                self.nick_lists.update(|lists| {
+                    lists.remove(&buffer_id);
+                });
+                self.backlog_loaded.update(|set| {
+                    set.remove(&buffer_id);
+                });
+            }
+            WebEvent::ConnectionStatus {
+                conn_id,
+                connected,
+                nick,
+                label,
+            } => {
+                self.connections.update(|conns| {
+                    if let Some(c) = conns.iter_mut().find(|c| c.id == conn_id) {
+                        c.connected = connected;
+                        c.nick = nick;
+                    } else {
+                        conns.push(ConnectionMeta {
+                            id: conn_id,
+                            label,
+                            nick,
+                            connected,
+                            user_modes: String::new(),
+                            lag: None,
+                        });
+                    }
+                });
+            }
+            WebEvent::Messages {
+                buffer_id,
+                messages,
+                ..
+            } => {
+                self.messages.update(|msgs| {
+                    let entry = msgs.entry(buffer_id.clone()).or_default();
+                    // Drop incoming messages whose id is already present
+                    // in the cache — happens when NewMessage events
+                    // arrive between sending FetchMessages and receiving
+                    // the response (the server serves the in-memory
+                    // buffer for `before=None`, which includes messages
+                    // the client already received live). id=0 is the
+                    // date-separator sentinel and is admitted unfiltered.
+                    let existing_ids: HashSet<u64> =
+                        entry.iter().filter(|m| m.id != 0).map(|m| m.id).collect();
+                    let filtered: Vec<_> = messages
+                        .into_iter()
+                        .filter(|m| m.id == 0 || !existing_ids.contains(&m.id))
+                        .collect();
+                    let with_separators = insert_date_separators(filtered);
+                    // Prepend older messages (they come from scroll-back).
+                    let mut combined = with_separators;
+                    combined.append(entry);
+                    cap_messages(&mut combined);
+                    *entry = combined;
+                });
+                // Mark this buffer's DB backlog as loaded so the Layout Effect
+                // won't re-fetch on subsequent switches to this buffer.
+                self.backlog_loaded.update(|set| {
+                    set.insert(buffer_id);
+                });
+            }
+            WebEvent::NickList {
+                buffer_id, nicks, ..
+            } => {
+                self.nick_lists.update(|lists| {
+                    let mut sorted = nicks;
+                    sort_nicks(&mut sorted);
+                    lists.insert(buffer_id, sorted);
+                });
+            }
+            WebEvent::MentionAlert { .. } => {
+                self.mention_count.update(|c| *c += 1);
+            }
+            WebEvent::MentionsList { .. } => {
+                self.mention_count.set(0);
+            }
+            WebEvent::NickEvent {
+                buffer_id,
+                kind,
+                nick,
+                new_nick,
+                prefix,
+                modes,
+                away,
+                ..
+            } => {
+                match kind {
+                    NickEventKind::Join => {
+                        self.nick_lists.update(|lists| {
+                            let list = lists.entry(buffer_id.clone()).or_default();
+                            if !list.iter().any(|n| n.nick == nick) {
+                                list.push(WireNick {
+                                    nick: nick.clone(),
+                                    prefix: prefix.unwrap_or_default(),
+                                    modes: modes.unwrap_or_default(),
+                                    away: away.unwrap_or(false),
+                                });
+                                sort_nicks(list);
+                            }
+                        });
+                        // Update nick_count.
+                        self.buffers.update(|bufs| {
+                            if let Some(b) = bufs.iter_mut().find(|b| b.id == buffer_id) {
+                                b.nick_count += 1;
+                            }
+                        });
+                    }
+                    NickEventKind::Part | NickEventKind::Quit => {
+                        self.nick_lists.update(|lists| {
+                            if let Some(list) = lists.get_mut(&buffer_id) {
+                                list.retain(|n| n.nick != nick);
+                            }
+                        });
+                        // Update nick_count.
+                        self.buffers.update(|bufs| {
+                            if let Some(b) = bufs.iter_mut().find(|b| b.id == buffer_id) {
+                                b.nick_count = b.nick_count.saturating_sub(1);
+                            }
+                        });
+                    }
+                    NickEventKind::NickChange => {
+                        if let Some(ref new) = new_nick {
+                            self.nick_lists.update(|lists| {
+                                if let Some(list) = lists.get_mut(&buffer_id)
+                                    && let Some(entry) = list.iter_mut().find(|n| n.nick == nick)
+                                {
+                                    entry.nick = new.clone();
+                                    sort_nicks(list);
+                                }
+                            });
+                        }
+                    }
+                    NickEventKind::ModeChange => {
+                        self.nick_lists.update(|lists| {
+                            if let Some(list) = lists.get_mut(&buffer_id) {
+                                if let Some(entry) = list.iter_mut().find(|n| n.nick == nick) {
+                                    if let Some(ref p) = prefix {
+                                        entry.prefix = p.clone();
+                                    }
+                                    if let Some(ref m) = modes {
+                                        entry.modes = m.clone();
+                                    }
+                                }
+                                sort_nicks(list);
+                            }
+                        });
+                    }
+                    NickEventKind::AwayChange => {
+                        self.nick_lists.update(|lists| {
+                            if let Some(list) = lists.get_mut(&buffer_id)
+                                && let Some(entry) = list.iter_mut().find(|n| n.nick == nick)
+                                && let Some(a) = away
+                            {
+                                entry.away = a;
+                            }
+                        });
+                    }
+                }
+            }
+            WebEvent::ActiveBufferChanged { buffer_id } => {
+                // Skip if the client already switched to this buffer locally
+                // (the click handler sets active_buffer before the server echoes).
+                // Without this guard:
+                // - The echo re-fires the Layout Effect, causing duplicate FetchMessages
+                // - Rapid clicks can be overridden by a stale echo for a previous buffer
+                //
+                // Multi-tab opt-out: this event is broadcast to ALL web
+                // sessions whenever the TUI flips its active buffer.
+                // A user with two browser tabs would see them both jump
+                // when the TUI moves. Set localStorage
+                // `web_follow_tui_buffer=false` to make this tab
+                // ignore TUI-driven buffer changes. Default is to
+                // follow (the single-tab + TUI workflow expects sync).
+                if !follow_tui_active_buffer() {
+                    return;
+                }
+                if self.active_buffer.get_untracked().as_deref() != Some(&buffer_id) {
+                    self.active_buffer.set(Some(buffer_id));
+                }
+            }
+            WebEvent::SettingsChanged {
+                timestamp_format,
+                line_height,
+                theme,
+                nick_column_width,
+                nick_max_length,
+                nick_colors,
+                nick_colors_in_nicklist,
+                nick_color_saturation,
+                nick_color_lightness,
+                emotes_enabled,
+            } => {
+                self.timestamp_format.set(timestamp_format);
+                self.line_height.set(line_height);
+                self.theme.set(theme);
+                if nick_column_width > 0 {
+                    self.nick_column_width.set(nick_column_width);
+                }
+                if nick_max_length > 0 {
+                    self.nick_max_length.set(nick_max_length);
+                }
+                self.nick_colors_enabled.set(nick_colors);
+                self.nick_colors_in_nicklist.set(nick_colors_in_nicklist);
+                self.nick_color_saturation.set(nick_color_saturation);
+                self.nick_color_lightness.set(nick_color_lightness);
+                self.emotes_enabled.set(emotes_enabled);
+            }
+            WebEvent::Error { message, .. } => {
+                self.error.set(Some(message));
+            }
+            WebEvent::ShellScreen {
+                buffer_id,
+                cols,
+                rows,
+                cursor_row,
+                cursor_col,
+                cursor_visible,
+                ..
+            } => {
+                // Only update if this shell buffer is currently active.
+                if self.active_buffer.get_untracked().as_deref() == Some(buffer_id.as_str()) {
+                    self.shell_screen
+                        .set(Some(crate::protocol::ShellScreenData {
+                            cols,
+                            rows,
+                            cursor_row,
+                            cursor_col,
+                            cursor_visible,
+                        }));
+                }
+            }
+        }
+    }
+
+    /// Sort buffers to match TUI order: mentions first → connection label → buffer type → name.
+    ///
+    /// Buffer type sort order: mentions(0) < server(1) < channel(2) < query(3) < dcc_chat(4) < special(5).
+    fn sort_buffers(&self) {
+        let connections = self.connections.get_untracked();
+        self.buffers.update(|bufs| {
+            bufs.sort_by(|a, b| {
+                // Mentions always sorts first, regardless of connection label.
+                let a_mentions = a.buffer_type == "mentions";
+                let b_mentions = b.buffer_type == "mentions";
+                b_mentions
+                    .cmp(&a_mentions)
+                    .then_with(|| {
+                        let label_a = connections
+                            .iter()
+                            .find(|c| c.id == a.connection_id)
+                            .map_or_else(
+                                || a.connection_id.to_lowercase(),
+                                |c| c.label.to_lowercase(),
+                            );
+                        let label_b = connections
+                            .iter()
+                            .find(|c| c.id == b.connection_id)
+                            .map_or_else(
+                                || b.connection_id.to_lowercase(),
+                                |c| c.label.to_lowercase(),
+                            );
+                        label_a.cmp(&label_b)
+                    })
+                    .then_with(|| {
+                        buf_type_order(&a.buffer_type).cmp(&buf_type_order(&b.buffer_type))
+                    })
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            });
+        });
+    }
+}
+
+fn cap_messages(messages: &mut Vec<WireMessage>) {
+    if messages.len() <= MAX_BUFFER_MESSAGES {
+        return;
+    }
+    let drop_count = messages.len() - MAX_BUFFER_MESSAGES;
+    messages.drain(..drop_count);
+    messages.shrink_to(MAX_BUFFER_MESSAGES);
+}
+
+fn buf_type_order(t: &str) -> u8 {
+    match t {
+        "mentions" => 0,
+        "server" => 1,
+        "channel" => 2,
+        "query" => 3,
+        "dcc_chat" => 4,
+        "special" => 5,
+        "shell" => 6,
+        _ => 7,
+    }
+}
+
+/// Sort nicks by prefix rank (~&@%+ order), then alphabetically.
+fn sort_nicks(nicks: &mut [WireNick]) {
+    nicks.sort_by(|a, b| {
+        prefix_rank(&a.prefix)
+            .cmp(&prefix_rank(&b.prefix))
+            .then_with(|| a.nick.to_lowercase().cmp(&b.nick.to_lowercase()))
+    });
+}
+
+fn prefix_rank(prefix: &str) -> u8 {
+    const ORDER: &str = "~&@%+";
+    prefix
+        .chars()
+        .next()
+        .and_then(|c| ORDER.find(c))
+        .map_or(ORDER.len() as u8, |i| i as u8)
+}
+
+/// Insert date separator lines between messages from different days.
+///
+/// Mirrors the TUI's `load_backlog` behavior — adds `─── Day, DD Mon YYYY ───`
+/// event lines at each date boundary in the message list.
+fn insert_date_separators(messages: Vec<WireMessage>) -> Vec<WireMessage> {
+    if messages.is_empty() {
+        return messages;
+    }
+
+    let mut result = Vec::with_capacity(messages.len() + 5);
+    let mut last_date: Option<chrono::NaiveDate> = None;
+
+    for msg in messages {
+        let local_date = chrono::DateTime::from_timestamp(msg.timestamp, 0).map(|dt| {
+            use chrono::TimeZone;
+            chrono::Local
+                .from_utc_datetime(&dt.naive_utc())
+                .date_naive()
+        });
+
+        if let Some(date) = local_date {
+            if last_date.is_some_and(|d| d != date) || last_date.is_none() {
+                let formatted = date.format("%a, %d %b %Y");
+                result.push(WireMessage {
+                    id: 0,
+                    timestamp: msg.timestamp,
+                    msg_type: "event".to_string(),
+                    nick: None,
+                    nick_mode: None,
+                    text: format!("\u{2500}\u{2500}\u{2500} {formatted} \u{2500}\u{2500}\u{2500}"),
+                    highlight: false,
+                    event_key: Some("date_separator".to_string()),
+                    previews: Vec::new(),
+                });
+            }
+            last_date = Some(date);
+        }
+
+        result.push(msg);
+    }
+
+    result
+}
+
+/// LocalStorage key controlling whether this browser tab follows
+/// `ActiveBufferChanged` events emitted by the TUI. Set to `"false"`
+/// to make this tab independent (typical multi-tab workflow). Any
+/// other value (missing, `"true"`) keeps the legacy follow behavior.
+const FOLLOW_TUI_BUFFER_KEY: &str = "web_follow_tui_buffer";
+
+fn follow_tui_active_buffer() -> bool {
+    let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) else {
+        return true;
+    };
+    !matches!(
+        storage.get_item(FOLLOW_TUI_BUFFER_KEY),
+        Ok(Some(ref v)) if v == "false"
+    )
+}
+
+const DISMISSED_PREVIEWS_KEY: &str = "repartee-dismissed-previews";
+const MAX_DISMISSED_ENTRIES: usize = 1000;
+
+/// Read the dismiss list from localStorage. Each entry is `<msg_id>\t<link>`,
+/// one per line. Malformed entries are silently dropped.
+fn load_dismissed_previews() -> HashSet<(u64, String)> {
+    let mut out = HashSet::new();
+    let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) else {
+        return out;
+    };
+    let Ok(Some(raw)) = storage.get_item(DISMISSED_PREVIEWS_KEY) else {
+        return out;
+    };
+    for line in raw.lines() {
+        if let Some((id_s, link)) = line.split_once('\t')
+            && let Ok(id) = id_s.parse::<u64>()
+        {
+            out.insert((id, link.to_string()));
+        }
+    }
+    out
+}
+
+/// Persist the dismiss list to localStorage. Capped at
+/// [`MAX_DISMISSED_ENTRIES`] (oldest by hash order) so a long-running
+/// session doesn't grow the key indefinitely.
+pub fn save_dismissed_previews(dismissed: &HashSet<(u64, String)>) {
+    let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) else {
+        return;
+    };
+    let mut entries: Vec<&(u64, String)> = dismissed.iter().collect();
+    if entries.len() > MAX_DISMISSED_ENTRIES {
+        // Keep the highest message ids — those are the most recent dismissals.
+        entries.sort_by_key(|e| std::cmp::Reverse(e.0));
+        entries.truncate(MAX_DISMISSED_ENTRIES);
+    }
+    let mut serialised = String::new();
+    for (id, link) in entries {
+        serialised.push_str(&id.to_string());
+        serialised.push('\t');
+        serialised.push_str(link);
+        serialised.push('\n');
+    }
+    let _ = storage.set_item(DISMISSED_PREVIEWS_KEY, &serialised);
+}

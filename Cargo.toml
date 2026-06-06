@@ -1,0 +1,110 @@
+[workspace]
+members = [".", "web-ui"]
+
+[package]
+name = "repartee"
+version = "1.4.3"
+edition = "2024"
+description = "A modern terminal IRC client built with Ratatui and Tokio"
+license = "MIT"
+repository = "https://github.com/outragedevs/repartee"
+homepage = "https://repart.ee/"
+readme = "README.md"
+keywords = ["irc", "terminal", "tui", "chat", "client"]
+categories = ["command-line-utilities", "network-programming"]
+authors = ["outragedevs"]
+exclude = [
+    ".adal/", ".agent/", ".augment/", ".codebuddy/", ".commandcode/",
+    ".continue/", ".crush/", ".factory/", ".goose/", ".iflow/",
+    ".junie/", ".kilocode/", ".kiro/", ".kode/", ".mcpjam/",
+    ".mux/", ".neovate/", ".openhands/", ".pi/", ".pochi/",
+    ".qoder/", ".qwen/", ".roo/", ".trae/", ".vibe/",
+    ".windsurf/", ".zencoder/", ".claude/",
+    "docs/node_modules/", "docs/bun.lock",
+]
+
+[dependencies]
+ratatui = "0.30"
+# Pin: ratatui-core 0.1.1 regressed wide-grapheme/skip-cell rendering
+# (emoji/image cells render blank). Held at 0.1.0 until upstream fix.
+ratatui-core = "=0.1.0"
+crossterm = { version = "0.29", features = ["event-stream", "serde"] }
+postcard = { version = "1.1", features = ["use-std"] }
+libc = "0.2"
+tokio = { version = "1.50", features = ["full"] }
+irc = { version = "1.5.1", package = "irc-repartee" }
+color-eyre = "0.6"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+unicode-width = "0.2"
+unicode-segmentation = "1"
+thiserror = "2.0"
+indexmap = { version = "2", features = ["serde"] }
+regex = "1"
+rusqlite = { version = "0.39", features = ["bundled-full"] }
+aes-gcm = "0.10"
+rand = "0.10"
+base64 = "0.22"
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", features = ["simple"] }
+uuid = { version = "1.21", features = ["v4"] }
+hex = "0.4"
+# E2E encryption (RPE2E v1.0)
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+bip39 = "2"
+zeroize = { version = "1", features = ["derive"] }
+mlua = { version = "0.11.6", features = ["lua54", "vendored", "send"] }
+ratatui-image = { version = "10.0", default-features = false, features = ["image-defaults", "crossterm"] }
+spellbook = "0.4"
+image = "0.25"
+reqwest = { version = "0.13", features = ["json", "rustls"], default-features = false }
+axum = { version = "0.8", features = ["ws"] }
+axum-extra = { version = "0.12", features = ["cookie-signed"] }
+# `time` is a transitive dep via axum-extra → cookie; declared directly so
+# we can construct `time::Duration` for `Cookie::max_age`.
+time = "0.3"
+tower = { version = "0.5", features = ["limit"] }
+rcgen = "0.14"
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+rust-embed = "8"
+# Used for the web-snapshot RwLock — std::sync::RwLock blocks the tokio
+# worker if it ever contends; parking_lot is a faster drop-in that is
+# safe to hold briefly from async (we never hold across an await).
+parking_lot = "0.12"
+portable-pty = "0.9.0"
+vt100 = "0.16.2"
+
+[dev-dependencies]
+tempfile = "3.26"
+
+# Swap glibc ptmalloc2 for jemalloc on Linux. glibc fragments its arena
+# under bursty allocation patterns in long-running processes (we observed
+# RSS growth to 3 GB over a week of uptime before the v0.8.4 chat_view fix).
+# jemalloc returns memory to the OS more aggressively and is already the
+# default system allocator on FreeBSD. macOS keeps libsystem_malloc.
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = "0.6"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+perf = { level = "deny", priority = 1 }
+redundant_clone = { level = "deny", priority = 2 }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

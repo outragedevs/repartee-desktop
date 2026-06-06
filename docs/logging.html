@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="repartee — A modern terminal IRC client built with Ratatui, Tokio, and Rust. Scripting, theming, encrypted logging, and more.">
+  <meta name="keywords" content="irc, terminal, tui, client, chat, repartee, ratatui, tokio, rust">
+  <meta name="author" content="outragedevs">
+  <meta property="og:title" content="Logging & Search — repartee">
+  <meta property="og:description" content="A modern terminal IRC client built with Ratatui, Tokio, and Rust. Inspired by irssi, designed for the future.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://outragedevs.github.io/repartee/">
+  <meta property="og:image" content="https://outragedevs.github.io/repartee/images/chat.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="{{title}} — repartee">
+  <meta name="twitter:description" content="A modern terminal IRC client built with Ratatui, Tokio, and Rust.">
+  <meta name="twitter:image" content="https://outragedevs.github.io/repartee/images/chat.png">
+  <title>{{title}} — repartee</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <!-- Mobile hamburger toggle -->
+  <button class="hamburger" aria-label="Toggle navigation">
+    <span></span>
+    <span></span>
+    <span></span>
+  </button>
+
+  <div class="page-wrapper">
+    <!-- Sidebar navigation -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <a href="index.html" class="brand">repartee</a>
+        <span class="brand-tagline">Documentation</span>
+      </div>
+      <nav class="sidebar-nav">
+          <ul>
+    <li><a href="index.html">Home</a></li>
+  </ul>
+  <div class="nav-section">
+    <span class="nav-section-title">Getting Started</span>
+    <ul>
+      <li><a href="installation.html">Installation</a></li>
+      <li><a href="first-connection.html">First Connection</a></li>
+      <li><a href="configuration.html">Configuration</a></li>
+    </ul>
+  </div>
+  <div class="nav-section">
+    <span class="nav-section-title">Reference</span>
+    <ul>
+      <li><a href="commands.html">Commands</a></li>
+      <li><a href="e2e.html">End-to-End Encryption</a></li>
+    </ul>
+  </div>
+  <div class="nav-section">
+    <span class="nav-section-title">Scripting</span>
+    <ul>
+      <li><a href="scripting-getting-started.html">Getting Started</a></li>
+      <li><a href="scripting-api.html">API Reference</a></li>
+      <li><a href="scripting-examples.html">Examples</a></li>
+    </ul>
+  </div>
+  <div class="nav-section">
+    <span class="nav-section-title">Customization</span>
+    <ul>
+      <li><a href="theming.html">Theming</a></li>
+      <li><a href="theming-format-strings.html">Format Strings</a></li>
+      <li><a href="logging.html" class="active">Logging & Search</a></li>
+    </ul>
+  </div>
+  <div class="nav-section">
+    <span class="nav-section-title">Usage</span>
+    <ul>
+      <li><a href="web-frontend.html">Web Frontend</a></li>
+      <li><a href="sessions.html">Sessions & Detach</a></li>
+    </ul>
+  </div>
+  <div class="nav-section">
+    <span class="nav-section-title">Project</span>
+    <ul>
+      <li><a href="architecture.html">Architecture</a></li>
+      <li><a href="faq.html">FAQ</a></li>
+    </ul>
+  </div>
+
+      </nav>
+      <div class="sidebar-footer">
+        Built with <a href="https://www.rust-lang.org">Rust</a>
+        &middot;
+        <a href="https://repart.ee/">GitHub</a>
+      </div>
+    </aside>
+
+    <!-- Overlay for mobile sidebar -->
+    <div class="sidebar-overlay"></div>
+
+    <!-- Main content -->
+    <div class="content-wrapper">
+      <main class="content">
+        <h1>Logging &amp; Search</h1>
+<p>repartee includes a built-in logging system backed by SQLite with optional encryption and full-text search.</p>
+<h2>Configuration</h2>
+<pre><code class="language-toml">[logging]
+enabled = true
+encrypt = false
+retention_days = 0              # 0 = keep forever
+event_retention_hours = 72      # auto-prune events after 72h (0 = keep forever)
+exclude_types = []              # e.g. [&quot;join&quot;, &quot;part&quot;, &quot;quit&quot;]
+</code></pre>
+<h2>Storage</h2>
+<p>Logs are stored in <code>~/.repartee/logs/messages.db</code> using SQLite with WAL (Write-Ahead Logging) mode for concurrent read/write performance.</p>
+<h3>Database schema</h3>
+<p>Each message is stored with:</p>
+<table>
+<thead>
+<tr>
+<th>Column</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>msg_id</code></td>
+<td>TEXT</td>
+<td>Unique UUID</td>
+</tr>
+<tr>
+<td><code>network</code></td>
+<td>TEXT</td>
+<td>Connection/network ID</td>
+</tr>
+<tr>
+<td><code>buffer</code></td>
+<td>TEXT</td>
+<td>Channel or query name</td>
+</tr>
+<tr>
+<td><code>timestamp</code></td>
+<td>INTEGER</td>
+<td>Unix timestamp</td>
+</tr>
+<tr>
+<td><code>msg_type</code></td>
+<td>TEXT</td>
+<td>Message type (privmsg, join, etc.)</td>
+</tr>
+<tr>
+<td><code>nick</code></td>
+<td>TEXT</td>
+<td>Sender nick</td>
+</tr>
+<tr>
+<td><code>text</code></td>
+<td>TEXT</td>
+<td>Message content</td>
+</tr>
+<tr>
+<td><code>highlight</code></td>
+<td>INTEGER</td>
+<td>1 if message is a highlight</td>
+</tr>
+<tr>
+<td><code>ref_id</code></td>
+<td>TEXT</td>
+<td>Reference to primary row (for fan-out dedup)</td>
+</tr>
+</tbody></table>
+<h3>Fan-out deduplication</h3>
+<p>Events like QUIT and NICK affect multiple channels. repartee stores a single full row for the first channel and reference rows (with empty text and a <code>ref_id</code> pointing to the primary) for subsequent channels. This saves storage while preserving per-channel history.</p>
+<h2>Encryption</h2>
+<p>When <code>encrypt = true</code>, message text is encrypted with AES-256-GCM before storage. The encryption key is derived from a passphrase stored in <code>~/.repartee/.env</code>:</p>
+<pre><code class="language-bash"># ~/.repartee/.env
+REPARTEE_LOG_KEY=your-secret-passphrase
+</code></pre>
+<p>Encrypted logs can only be searched/read with the correct key.</p>
+<h2>Full-text search</h2>
+<p>repartee uses SQLite FTS5 for fast full-text search across all logs:</p>
+<pre><code>/log search &lt;query&gt;
+</code></pre>
+<p>Search supports standard FTS5 syntax including phrase matching (<code>&quot;exact phrase&quot;</code>), prefix matching (<code>prefix*</code>), and boolean operators (<code>AND</code>, <code>OR</code>, <code>NOT</code>).</p>
+<h2>Commands</h2>
+<h3><code>/log status</code></h3>
+<p>Show logging status, database size, and message count.</p>
+<h3><code>/log search &lt;query&gt;</code></h3>
+<p>Search across all logged messages.</p>
+<h2>Read-only log browser</h2>
+<p>Start repartee in log browser mode to inspect history without connecting to IRC:</p>
+<pre><code class="language-bash">repartee l
+repartee logs
+</code></pre>
+<p>This mode opens the log database read-only, disables IRC connections, web services,
+scripts, and autoconnect, then renders stored buffers with the normal TUI. Scroll up
+to page older messages, press <code>Q</code> or use <code>/quit</code> to exit, and use <code>/search &lt;query&gt;</code>
+for full-text search when logs are not encrypted.</p>
+<h2>Chat history backlog</h2>
+<p>When you open a channel, query, or DCC chat buffer, repartee automatically loads the most recent messages from the log database — so you immediately see recent context without scrolling.</p>
+<pre><code>/set display.backlog_lines 20    # default — load last 20 messages
+/set display.backlog_lines 50    # load more history
+/set display.backlog_lines 0     # disable backlog
+</code></pre>
+<p>Backlog messages appear at the top of the buffer, followed by a separator:</p>
+<pre><code>─── End of backlog (20 lines) ───
+</code></pre>
+<p>Date separator lines are automatically inserted between messages from different days for easier history reading. Day-changed markers also appear at midnight in all active chat buffers. Both the <code>date_separator</code> and <code>backlog_end</code> formats are customizable via the <a href="theming.html">theming system</a>.</p>
+<p>Backlog messages do not trigger highlights or notifications, and are not re-logged to the database (they already exist). This works for autoconnect channels, manual <code>/join</code>, queries opened via incoming messages, and DCC chat reconnections.</p>
+<h2>Event retention</h2>
+<p>Event messages (join, part, quit, nick, kick, mode changes) are high-volume noise that accumulates over time. The <code>event_retention_hours</code> setting automatically prunes old event messages while keeping actual chat history intact.</p>
+<pre><code>/set logging.event_retention_hours 72    # default — keep 3 days of events
+/set logging.event_retention_hours 24    # aggressive — only 1 day
+/set logging.event_retention_hours 0     # disable — keep events forever
+</code></pre>
+<p>Pruning runs on startup and every hour in the background. It only deletes rows with <code>type = &#39;event&#39;</code> — chat messages, actions, notices, and CTCPs are never touched regardless of their age.</p>
+<p>This complements <code>retention_days</code> which controls the maximum age for <strong>all</strong> message types. When both are set, event messages are pruned at whichever threshold is reached first.</p>
+<h2>Batched writes</h2>
+<p>Messages are written to the database in batches (50 rows or every 1 second) using an async writer task connected via a tokio mpsc channel. This minimizes SQLite lock contention and ensures the UI never blocks on disk I/O.</p>
+
+
+        <!-- Prev / Next navigation -->
+        <nav class="page-nav">
+          <a href="theming-format-strings.html" class="page-nav-link prev">
+  <span class="page-nav-label">&larr; Previous</span>
+  <span class="page-nav-title">Format Strings</span>
+</a>
+          <a href="web-frontend.html" class="page-nav-link next">
+  <span class="page-nav-label">Next &rarr;</span>
+  <span class="page-nav-title">Web Frontend</span>
+</a>
+        </nav>
+
+        <footer class="site-footer">
+          Built with <a href="https://www.rust-lang.org">Rust</a> &middot;
+          <a href="https://repart.ee/">GitHub</a> &middot;
+          MIT License
+        </footer>
+      </main>
+    </div>
+  </div>
+
+  <script>
+    // Mobile sidebar toggle
+    (function() {
+      const hamburger = document.querySelector('.hamburger');
+      const sidebar = document.querySelector('.sidebar');
+      const overlay = document.querySelector('.sidebar-overlay');
+
+      function toggleSidebar() {
+        hamburger.classList.toggle('active');
+        sidebar.classList.toggle('open');
+        overlay.classList.toggle('visible');
+        document.body.style.overflow = sidebar.classList.contains('open') ? 'hidden' : '';
+      }
+
+      function closeSidebar() {
+        hamburger.classList.remove('active');
+        sidebar.classList.remove('open');
+        overlay.classList.remove('visible');
+        document.body.style.overflow = '';
+      }
+
+      hamburger.addEventListener('click', toggleSidebar);
+      overlay.addEventListener('click', closeSidebar);
+
+      // Close sidebar on Escape key
+      document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape' && sidebar.classList.contains('open')) {
+          closeSidebar();
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
