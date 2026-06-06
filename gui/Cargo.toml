@@ -1,0 +1,27 @@
+[package]
+name = "repartee-gui"
+version = "0.1.0"
+edition = "2024"
+description = "Native desktop GUI for Repartee — iced frontend (MVP)"
+license = "MIT"
+repository = "https://github.com/outragedevs/repartee"
+homepage = "https://repart.ee/"
+
+[[bin]]
+name = "repartee-gui"
+path = "src/main.rs"
+
+[dependencies]
+# Upstream stable iced (crates.io). Halloy rides a 0.15-dev fork for extra
+# text/selection patches; we start on stable for reliability and revisit if
+# needed (see docs/superpowers/specs/*-iced-gui-design.md).
+iced = { version = "0.13", features = ["tokio", "advanced"] }
+irc = { version = "1.5.1", package = "irc-repartee" }
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+futures = "0.3"
+chrono = { version = "0.4", features = ["clock"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+dirs = "6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
