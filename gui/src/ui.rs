@@ -1,9 +1,7 @@
 //! View layer — a halloy-style 3-pane layout (buffers · chat · nicks) rendered
 //! in FiraCode.
 
-use iced::widget::{
-    button, column, container, row, scrollable, text, text_input, Space,
-};
+use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Alignment, Color, Element, Length};
 
 use crate::app::{App, Message};
@@ -35,9 +33,14 @@ pub fn view(app: &App) -> Element<'_, Message> {
 fn sidebar(app: &App) -> Element<'_, Message> {
     let mut items: Vec<Element<Message>> = Vec::with_capacity(app.buffers.len() + 1);
     items.push(
-        container(text("REPARTEE").size(15).font(theme::bold()).color(theme::ACCENT))
-            .padding([10, 12])
-            .into(),
+        container(
+            text("REPARTEE")
+                .size(15)
+                .font(theme::bold())
+                .color(theme::ACCENT),
+        )
+        .padding([10, 12])
+        .into(),
     );
 
     for (i, buf) in app.buffers.iter().enumerate() {
@@ -56,7 +59,14 @@ fn sidebar(app: &App) -> Element<'_, Message> {
         .padding([5, 12])
         .on_press(Message::SelectBuffer(i))
         .style(move |_, _| button::Style {
-            background: Some(if active { theme::BG_ACTIVE } else { Color::TRANSPARENT }.into()),
+            background: Some(
+                if active {
+                    theme::BG_ACTIVE
+                } else {
+                    Color::TRANSPARENT
+                }
+                .into(),
+            ),
             text_color: if active { theme::TEXT } else { theme::DIM },
             border: iced::Border {
                 radius: 4.0.into(),
@@ -107,10 +117,15 @@ fn chat_pane(app: &App) -> Element<'_, Message> {
     });
 
     let lines: Vec<Element<Message>> = buf.lines.iter().map(line_view).collect();
-    let log = scrollable(column(lines).spacing(2).padding([8, 12]).width(Length::Fill))
-        .id(app.log_id.clone())
-        .height(Length::Fill)
-        .width(Length::Fill);
+    let log = scrollable(
+        column(lines)
+            .spacing(2)
+            .padding([8, 12])
+            .width(Length::Fill),
+    )
+    .id(app.log_id.clone())
+    .height(Length::Fill)
+    .width(Length::Fill);
 
     let input = text_input(
         if buf.kind == BufferKind::Server {

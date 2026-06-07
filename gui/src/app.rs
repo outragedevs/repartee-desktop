@@ -156,8 +156,11 @@ impl App {
                     self.buffers[idx].add_user(String::new(), n);
                     if n == &self.nick {
                         self.active = idx;
-                        self.buffers[idx]
-                            .push(Line::now(LineKind::Event, None, format!("Joined {chan}")));
+                        self.buffers[idx].push(Line::now(
+                            LineKind::Event,
+                            None,
+                            format!("Joined {chan}"),
+                        ));
                     } else {
                         self.buffers[idx].push(Line::now(
                             LineKind::Event,
@@ -175,14 +178,28 @@ impl App {
                     self.buffers[idx].push(Line::now(
                         LineKind::Event,
                         None,
-                        format!("← {n} left {}", if r.is_empty() { String::new() } else { format!("({r})") }),
+                        format!(
+                            "← {n} left {}",
+                            if r.is_empty() {
+                                String::new()
+                            } else {
+                                format!("({r})")
+                            }
+                        ),
                     ));
                 }
             }
             Command::QUIT(reason) => {
                 if let Some(n) = &src {
                     let r = reason.clone().unwrap_or_default();
-                    let msg = format!("⤫ {n} quit{}", if r.is_empty() { String::new() } else { format!(" ({r})") });
+                    let msg = format!(
+                        "⤫ {n} quit{}",
+                        if r.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({r})")
+                        }
+                    );
                     for b in &mut self.buffers {
                         if b.has_user(n) {
                             b.remove_user(n);

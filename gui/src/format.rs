@@ -165,12 +165,18 @@ mod tests {
 
     #[test]
     fn strips_codes() {
-        assert_eq!(strip_irc_formatting("\x02\x034,2\x1Fhi\x0F there"), "hi there");
+        assert_eq!(
+            strip_irc_formatting("\x02\x034,2\x1Fhi\x0F there"),
+            "hi there"
+        );
     }
 
     #[test]
     fn nick_color_deterministic_and_case_insensitive() {
-        assert_eq!(nick_color("Ferris", 0.65, 0.65), nick_color("ferris", 0.65, 0.65));
+        assert_eq!(
+            nick_color("Ferris", 0.65, 0.65),
+            nick_color("ferris", 0.65, 0.65)
+        );
     }
 
     #[test]

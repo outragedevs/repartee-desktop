@@ -74,7 +74,11 @@ async fn run(
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
     while let Some(message) = stream.next().await.transpose()? {
-        if output.send(Event::Message(Box::new(message))).await.is_err() {
+        if output
+            .send(Event::Message(Box::new(message)))
+            .await
+            .is_err()
+        {
             break;
         }
     }
